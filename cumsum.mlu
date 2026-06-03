@@ -2,26 +2,24 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 #include <vector>
-#include <cstdint>
 
-// 核函数：对多个序列进行累加前缀和
-// input: 输入张量指针 (float)
-// output: 输出张量指针 (float)
-// offsets: 每个序列首元素相对于张量起始的偏移量 (元素个数)
-// num_seqs: 该核需要处理的序列数量
-// dim_size: 每个序列的长度
-// stride_dim: 沿 dim 维度的步长 (元素个数)
+// 核函数：对每个独立序列执行前缀和累加
+// input: 输入张量 (float)
+// output: 输出张量 (float)
+// offsets: 每个序列首元素相对于张量起始的偏移量（元素个数）
+// dim_size: 序列长度（指定维度的长度）
+// stride_dim: 沿指定维度的步长（元素个数）
+// num_seqs: 序列总数
 __mlu_entry__ void cumsum_kernel(float* input,
                                  float* output,
                                  const int64_t* offsets,
-                                 int num_seqs,
                                  int dim_size,
-                                 int64_t stride_dim) {
-    // 获取当前核的 ID 和总核数
+                                 int64_t stride_dim,
+                                 int num_seqs) {
     uint32_t core_id = taskId;
     uint32_t core_num = taskDim;
 
-    // 计算每个核处理的序列范围
+    // 每个核处理的序列数量
     int seqs_per_core = (num_seqs + core_num - 1) / core_num;
     int start_seq = core_id * seqs_per_core;
     int end_seq = start_seq + seqs_per_core;
@@ -29,29 +27,27 @@ __mlu_entry__ void cumsum_kernel(float* input,
 
     // 处理分配给当前核的序列
     for (int seq = start_seq; seq < end_seq; ++seq) {
-        int64_t base_offset = offsets[seq];   // 序列首元素偏移
+        int64_t base = offsets[seq];
         float prefix = 0.0f;
-
-        // 沿 dim 维度顺序累加
         for (int i = 0; i < dim_size; ++i) {
-            int64_t idx = base_offset + i * stride_dim;
-            float val = input[idx];
-            prefix += val;
+            int64_t idx = base + i * stride_dim;
+            prefix += input[idx];
             output[idx] = prefix;
         }
     }
 }
 
-// 主机端封装函数
+// 主机端封装函数，供 PyTorch 调用
 torch::Tensor bang_func(torch::Tensor x, int dim) {
-    // 维度合法性检查
+    // 维度归一化与合法性检查
     int ndim = x.dim();
     if (dim < 0) dim += ndim;
     TORCH_CHECK(dim >= 0 && dim < ndim, "Invalid dim");
-    // 要求输入连续
+
+    // 确保输入连续
     x = x.contiguous();
 
-    // 转换为 fp32 进行计算
+    // 转换为 float32 进行计算
     torch::Tensor input_fp32 = x;
     auto original_dtype = x.scalar_type();
     if (original_dtype != torch::kFloat) {
@@ -61,17 +57,17 @@ torch::Tensor bang_func(torch::Tensor x, int dim) {
     // 输出张量
     torch::Tensor output_fp32 = torch::empty_like(input_fp32);
 
-    // 获取张量形状、步长等信息
-    auto shape = input_fp32.sizes();          // 各维度长度
-    auto strides = input_fp32.strides();     // 各维度步长 (元素个数)
-    int64_t dim_size = shape[dim];            // 指定维度的长度
-    int64_t stride_dim = strides[dim];        // 指定维度的步长
+    // 获取形状、步长等信息
+    auto shape = input_fp32.sizes();
+    auto strides = input_fp32.strides();
+    int64_t dim_size = shape[dim];
+    int64_t stride_dim = strides[dim];
     int64_t total_elements = input_fp32.numel();
     int64_t num_seqs = total_elements / dim_size;  // 序列总数
 
     // ---------- 计算每个序列首元素的偏移量 ----------
     std::vector<int64_t> host_offsets(num_seqs);
-    // 构建除 dim 以外的维度信息
+    // 收集除 dim 以外的维度信息
     std::vector<int64_t> other_dims;
     std::vector<int64_t> other_strides;
     for (int d = 0; d < ndim; ++d) {
@@ -81,16 +77,16 @@ torch::Tensor bang_func(torch::Tensor x, int dim) {
     }
     int other_rank = other_dims.size();
 
-    // 计算 each_other_stride 用于分解线性索引
+    // 计算每个 other 维度的累乘因子，用于线性索引分解
     std::vector<int64_t> mult(other_rank, 1);
     for (int i = other_rank - 1; i > 0; --i) {
         mult[i-1] = mult[i] * other_dims[i];
     }
-    // 遍历每一个序列
+
+    // 为每个序列计算偏移量
     for (int64_t seq = 0; seq < num_seqs; ++seq) {
         int64_t tmp = seq;
         int64_t offset = 0;
-        // 将线性索引 seq 分解为各 other 维度的索引
         for (int d = 0; d < other_rank; ++d) {
             int64_t idx = tmp / mult[d];
             tmp %= mult[d];
@@ -102,13 +98,13 @@ torch::Tensor bang_func(torch::Tensor x, int dim) {
     // 将偏移量数组拷贝到设备端
     int64_t* dev_offsets = nullptr;
     size_t offsets_bytes = num_seqs * sizeof(int64_t);
-    cnrtMalloc(&dev_offsets, offsets_bytes);
-    cnrtMemcpy(dev_offsets, host_offsets.data(), offsets_bytes, CNRT_MEMCPY_HOST_TO_DEVICE);
+    cnrtMalloc((void**)&dev_offsets, offsets_bytes);
+    cnrtMemcpy(dev_offsets, host_offsets.data(), offsets_bytes, CNRT_MEM_TRANS_DIR_HOST2DEV);
 
-    // 获取 MLU 队列
+    // 获取当前 MLU 队列
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
-    // 设置核函数启动参数 (使用 Union1 类型，taskDim 暂定为 256)
+    // 启动核函数（使用 Union1 类型，256 个核）
     cnrtDim3_t dim3 = {256, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
@@ -116,9 +112,9 @@ torch::Tensor bang_func(torch::Tensor x, int dim) {
         input_fp32.data_ptr<float>(),
         output_fp32.data_ptr<float>(),
         dev_offsets,
-        num_seqs,
         dim_size,
-        stride_dim
+        stride_dim,
+        num_seqs
     );
 
     // 释放设备端偏移数组
