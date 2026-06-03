@@ -5,8 +5,8 @@
 
 #define CIN_TILE 8
 #define COUT_TILE 8
-#define H_TILE 32
-#define W_TILE 32
+#define H_TILE 24
+#define W_TILE 24
 #define K 3
 #define H_EXT (H_TILE+K-1)
 #define W_EXT (W_TILE+K-1)
@@ -26,9 +26,10 @@ __mlu_entry__ void convtransp2d_kernel(
     uint32_t sb = cid * bpc + (cid < brem ? cid : brem);
     uint32_t mb = bpc + (cid < brem ? 1 : 0);
 
+    // nk now has a COUT_TILE dimension – fixes the weight-overwrite bug
     __nram__ float ni[CIN_TILE][H_EXT][W_EXT];
     __nram__ float na[COUT_TILE][H_TILE][W_TILE];
-    __nram__ float nk[CIN_TILE][K][K];
+    __nram__ float nk[CIN_TILE][COUT_TILE][K][K];
 
     for (uint32_t b = 0; b < mb; b++) {
         uint32_t bi = sb + b;
@@ -55,18 +56,27 @@ __mlu_entry__ void convtransp2d_kernel(
                     for (uint32_t ci_g = 0; ci_g < CI; ci_g += CIN_TILE) {
                         uint32_t cit = (ci_g + CIN_TILE <= CI) ? CIN_TILE : (CI - ci_g);
 
-                        // ===========================================
-                        // Phase 1: load input tiles for all ci
-                        // ===========================================
+                        // load kernel (all co, all ci) + input (per ci)
                         for (uint32_t ci = 0; ci < cit; ci++) {
                             uint32_t gci = ci_g + ci;
+
+                            // load flipped kernel weights into nk[ci][co][kh][kw]
+                            for (uint32_t co = 0; co < cot; co++) {
+                                uint32_t gco = co_g + co;
+                                for (uint32_t kh = 0; kh < K; kh++)
+                                    for (uint32_t kw = 0; kw < K; kw++)
+                                        nk[ci][co][kh][kw] = kernel_gdr[
+                                            (gci * CO + gco) * K * K
+                                            + (K - 1 - kh) * K
+                                            + (K - 1 - kw)];
+                            }
 
                             // zero the input tile
                             for (uint32_t i = 0; i < he; i++)
                                 for (uint32_t j = 0; j < we; j++)
                                     ni[ci][i][j] = 0.0f;
 
-                            // load valid region
+                            // load valid input region
                             int prs = (int)ho;
                             int pre = (int)(ho + he - 1);
                             int vs = K - 1;
@@ -75,7 +85,7 @@ __mlu_entry__ void convtransp2d_kernel(
                             int ce = (pre < ve) ? pre : ve;
 
                             for (int r = cs; r <= ce; r++) {
-                                int ir = r - (K - 1);     // input row index
+                                int ir = r - (K - 1);
                                 int pcs = (int)wo;
                                 int pce = (int)(wo + we - 1);
                                 int wvs = K - 1;
@@ -93,39 +103,20 @@ __mlu_entry__ void convtransp2d_kernel(
                             }
                         }
 
-                        // ===========================================
-                        // Phase 2: for each co, load kernel then accumulate
-                        // ===========================================
-                        for (uint32_t co = 0; co < cot; co++) {
-                            uint32_t gco = co_g + co;
-
-                            // load flipped kernel for THIS output channel
-                            for (uint32_t ci = 0; ci < cit; ci++) {
-                                uint32_t gci = ci_g + ci;
-                                for (uint32_t kh = 0; kh < K; kh++)
-                                    for (uint32_t kw = 0; kw < K; kw++)
-                                        nk[ci][kh][kw] = kernel_gdr[
-                                            (gci * CO + gco) * K * K
-                                            + (K - 1 - kh) * K
-                                            + (K - 1 - kw)];
-                            }
-
-                            // accumulate for THIS output channel
+                        // convolution: na[co][hi][wi] += nk[ci][co][kh][kw] * ni[ci][hi+kh][wi+kw]
+                        for (uint32_t co = 0; co < cot; co++)
                             for (uint32_t ci = 0; ci < cit; ci++)
                                 for (uint32_t kh = 0; kh < K; kh++)
                                     for (uint32_t kw = 0; kw < K; kw++) {
-                                        float wk = nk[ci][kh][kw];
+                                        float wk = nk[ci][co][kh][kw];
                                         for (uint32_t hi = 0; hi < ht; hi++)
                                             for (uint32_t wi = 0; wi < wt; wi++)
                                                 na[co][hi][wi] +=
                                                     wk * ni[ci][hi + kh][wi + kw];
                                     }
-                        }
                     }
 
-                    // ===========================================
-                    // Store output tile
-                    // ===========================================
+                    // store output tile
                     for (uint32_t co = 0; co < cot; co++) {
                         uint32_t gco = co_g + co;
                         for (uint32_t hi = 0; hi < ht; hi++)
