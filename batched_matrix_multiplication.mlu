@@ -8,9 +8,12 @@
 //   Inner SAXPY C[i][:] += aik * B[kk][:] uses BANG vector intrinsics
 //   (__bang_mul_scalar + __bang_add), ~100x faster than scalar loop.
 //   NRAM: 64*64 + 64*256 + 64*256 + 256 = 42K floats = 168 KB.
+//   N=2048 is a multiple of TILE_N=256, so n_tile is always 256;
+//   ALIGNED_N is a compile-time constant required by BANG intrinsics.
 #define TILE_M 64
 #define TILE_N 256
 #define TILE_K 64
+#define ALIGNED_N 256
 
 // MLU kernel: batched matrix multiplication C = A @ B
 //   BANG vector intrinsics for inner SAXPY: C[i][:] += aik * B[kk][:]
@@ -51,7 +54,6 @@ __mlu_entry__ void batched_matmul_kernel(
             uint32_t m_tile = (m_off + TILE_M <= M) ? TILE_M : (M - m_off);
             for (uint32_t n_off = 0; n_off < N; n_off += TILE_N) {
                 uint32_t n_tile = (n_off + TILE_N <= N) ? TILE_N : (N - n_off);
-                uint32_t aligned_n = (n_tile + 63) & ~63;
 
                 // Zero-initialize C tile on NRAM
                 for (uint32_t i = 0; i < m_tile; i++)
@@ -79,9 +81,9 @@ __mlu_entry__ void batched_matmul_kernel(
                         for (uint32_t kk = 0; kk < k_tile; kk++) {
                             float aik = nram_A[i][kk];
                             // temp[:] = aik * B[kk][:]
-                            __bang_mul_scalar(nram_temp, nram_B[kk], aik, aligned_n);
+                            __bang_mul_scalar(nram_temp, nram_B[kk], aik, ALIGNED_N);
                             // C[i][:] += temp[:]
-                            __bang_add(nram_C[i], nram_C[i], nram_temp, aligned_n);
+                            __bang_add(nram_C[i], nram_C[i], nram_temp, ALIGNED_N);
                         }
                 }
 

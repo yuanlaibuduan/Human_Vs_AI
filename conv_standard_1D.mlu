@@ -99,7 +99,9 @@ __mlu_entry__ void conv1d_kernel(
 
 // C++ wrapper called by PyTorch
 torch::Tensor bang_func(torch::Tensor x, torch::Tensor kernel,
-                        int in_channels, int out_channels, int kernel_size) {
+                        int in_channels, int out_channels, int kernel_size,
+                        int stride, int padding, int dilation,
+                        int groups, int bias) {
     TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
     TORCH_CHECK(kernel.is_contiguous(), "Kernel must be contiguous");
 
@@ -114,7 +116,7 @@ torch::Tensor bang_func(torch::Tensor x, torch::Tensor kernel,
     int batch_size = input_fp32.size(0);
     int L = input_fp32.size(2);
     int K = kernel_size;
-    int L_out = L - K + 1;  // stride=1, padding=0
+    int L_out = (L + 2 * padding - dilation * (K - 1) - 1) / stride + 1;
 
     auto output_fp32 = torch::empty(
         {batch_size, out_channels, L_out}, input_fp32.options());
