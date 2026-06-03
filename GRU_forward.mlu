@@ -2,14 +2,16 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 #include <cstdint>
+#include <algorithm>
 
+#define MAX_DIM 4096           // 支持的最大 hidden_size / input_size
 #define ALIGN(len) (((len) + 63) & ~63)
 
 __mlu_entry__ void multi_layer_gru_kernel(
     const float* input,           // [batch, seq_len, input_size]
     float* output,                // [batch, seq_len, hidden_size]
     float* temp_layers,           // [num_layers-1, batch, seq_len, hidden_size] (NULL if num_layers==1)
-    const float* weight_ih,       // [num_layers, 3*hidden_size, max_dim] where max_dim = max(input_size, hidden_size)
+    const float* weight_ih,       // [num_layers, 3*hidden_size, max_dim]
     const float* weight_hh,       // [num_layers, 3*hidden_size, hidden_size]
     const float* bias,            // [num_layers, 3*hidden_size]
     int batch,
@@ -17,43 +19,45 @@ __mlu_entry__ void multi_layer_gru_kernel(
     int input_size,
     int hidden_size,
     int num_layers,
-    int max_dim                  // = max(input_size, hidden_size)
+    int max_dim
 ) {
-    // 获取核心ID和核心总数
+    // 检查维度是否超出 NRAM 容量
+    int aligned_input_size = ALIGN(input_size);
+    int aligned_hidden_size = ALIGN(hidden_size);
+    if (aligned_input_size > MAX_DIM || aligned_hidden_size > MAX_DIM) {
+        // 若超出，直接返回（实际应用中应在 host 端做检查）
+        return;
+    }
+
+    // 获取核心 ID 和核心总数
     uint32_t core_id = taskId;
     uint32_t core_num = taskDim;
 
-    // 每个核心处理的batch数量
+    // 每个核心处理的 batch 数量
     int batch_per_core = batch / core_num;
     int rem = batch % core_num;
     int start_batch = core_id * batch_per_core + (core_id < rem ? core_id : rem);
     int end_batch = start_batch + batch_per_core + (core_id < rem ? 1 : 0);
     if (start_batch >= end_batch) return;
 
-    // 对齐长度
-    int aligned_input_size = ALIGN(input_size);
-    int aligned_hidden_size = ALIGN(hidden_size);
-    int aligned_gate_size = ALIGN(3 * hidden_size);
+    // 固定大小的 NRAM 缓冲区
+    __nram__ float nram_x[MAX_DIM];
+    __nram__ float nram_h[MAX_DIM];
+    __nram__ float nram_gate[3 * MAX_DIM];
+    __nram__ float nram_z[MAX_DIM];
+    __nram__ float nram_r[MAX_DIM];
+    __nram__ float nram_n[MAX_DIM];
+    __nram__ float nram_tmp[MAX_DIM];
 
-    // NRAM缓冲区
-    __nram__ float nram_x[aligned_input_size];
-    __nram__ float nram_h[aligned_hidden_size];
-    __nram__ float nram_gate[aligned_gate_size];
-    __nram__ float nram_z[aligned_hidden_size];
-    __nram__ float nram_r[aligned_hidden_size];
-    __nram__ float nram_n[aligned_hidden_size];
-    __nram__ float nram_tmp[aligned_hidden_size];
-
-    // 遍历每个batch
+    // 遍历每个 batch
     for (int b = start_batch; b < end_batch; ++b) {
-        // 当前batch的输入基地址 (第一层)
+        // 当前 batch 的输入基地址（第一层）
         const float* batch_input = input + b * seq_len * input_size;
-        // 当前batch的输出基地址 (最后一层)
+        // 当前 batch 的输出基地址（最后一层）
         float* batch_output = output + b * seq_len * hidden_size;
 
         // 逐层计算
         for (int l = 0; l < num_layers; ++l) {
-            // 当前层的输入维度
             int in_dim = (l == 0) ? input_size : hidden_size;
             int aligned_in_dim = ALIGN(in_dim);
 
@@ -62,8 +66,6 @@ __mlu_entry__ void multi_layer_gru_kernel(
             if (l == 0) {
                 layer_input = batch_input;
             } else {
-                // 从temp_layers中读取上一层输出
-                // temp_layers形状: [num_layers-1, batch, seq_len, hidden_size]
                 const float* temp_base = temp_layers + (l - 1) * batch * seq_len * hidden_size;
                 layer_input = temp_base + b * seq_len * hidden_size;
             }
@@ -82,28 +84,23 @@ __mlu_entry__ void multi_layer_gru_kernel(
             const float* w_hh_layer = weight_hh + l * 3 * hidden_size * hidden_size;
             const float* bias_layer = bias + l * 3 * hidden_size;
 
-            // 初始化隐藏状态h为全0
+            // 初始化隐藏状态 h 为全 0
             __bang_write_zero(nram_h, aligned_hidden_size);
 
             // 遍历序列
             for (int t = 0; t < seq_len; ++t) {
-                // 读取当前时间步的输入向量x_t
+                // 读取当前时间步的输入向量 x_t
                 const float* x_ptr = layer_input + t * in_dim;
                 __memcpy(nram_x, x_ptr, in_dim * sizeof(float), GDRAM2NRAM);
 
                 // 计算门向量 gate = W_ih * x + W_hh * h + bias
-                // 先清零gate
-                __bang_write_zero(nram_gate, aligned_gate_size);
-
-                // 计算 W_ih * x 部分 (每个gate输出元素)
+                __bang_write_zero(nram_gate, 3 * aligned_hidden_size);
                 for (int i = 0; i < 3 * hidden_size; ++i) {
-                    const float* w_row = w_ih_layer + i * max_dim;
+                    const float* w_ih_row = w_ih_layer + i * max_dim;
                     float sum = bias_layer[i];
-                    // 向量点积
                     for (int k = 0; k < in_dim; ++k) {
-                        sum += w_row[k] * nram_x[k];
+                        sum += w_ih_row[k] * nram_x[k];
                     }
-                    // 加上 W_hh * h 部分
                     const float* w_hh_row = w_hh_layer + i * hidden_size;
                     for (int k = 0; k < hidden_size; ++k) {
                         sum += w_hh_row[k] * nram_h[k];
@@ -112,32 +109,27 @@ __mlu_entry__ void multi_layer_gru_kernel(
                 }
 
                 // 拆分门向量
-                // z = sigmoid(gate[0:hidden_size])
                 __memcpy(nram_z, nram_gate, hidden_size * sizeof(float), NRAM2NRAM);
                 __bang_active_sigmoid(nram_z, nram_z, aligned_hidden_size);
-                // r = sigmoid(gate[hidden_size:2*hidden_size])
+
                 __memcpy(nram_r, nram_gate + hidden_size, hidden_size * sizeof(float), NRAM2NRAM);
                 __bang_active_sigmoid(nram_r, nram_r, aligned_hidden_size);
-                // n_raw = gate[2*hidden_size:3*hidden_size]
+
                 __memcpy(nram_n, nram_gate + 2 * hidden_size, hidden_size * sizeof(float), NRAM2NRAM);
                 __bang_active_tanh(nram_n, nram_n, aligned_hidden_size);
 
                 // 新隐藏状态 h_new = (1 - z) * h + z * n
-                // tmp = 1 - z
                 __bang_sub_scalar(nram_tmp, nram_z, 1.0f, aligned_hidden_size);
-                // tmp = tmp * h
                 __bang_mul(nram_tmp, nram_tmp, nram_h, aligned_hidden_size);
-                // n = z * n
                 __bang_mul(nram_n, nram_z, nram_n, aligned_hidden_size);
-                // h_new = tmp + n
                 __bang_add(nram_h, nram_tmp, nram_n, aligned_hidden_size);
 
-                // 将当前时间步的隐藏状态写入输出
+                // 写入输出
                 float* out_ptr = layer_output + t * hidden_size;
                 __memcpy(out_ptr, nram_h, hidden_size * sizeof(float), NRAM2GDRAM);
-            } // 时间步循环结束
-        } // 层循环结束
-    } // batch循环结束
+            }
+        }
+    }
 }
 
 torch::Tensor bang_func(
@@ -148,20 +140,18 @@ torch::Tensor bang_func(
     torch::Tensor weight_hh,
     torch::Tensor bias
 ) {
-    // 输入检查
+    // 维度检查
     TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
     TORCH_CHECK(weight_ih.is_contiguous(), "weight_ih must be contiguous");
     TORCH_CHECK(weight_hh.is_contiguous(), "weight_hh must be contiguous");
     TORCH_CHECK(bias.is_contiguous(), "bias must be contiguous");
 
-    // 转换为float32
     auto original_dtype = input.scalar_type();
     torch::Tensor input_fp32 = input;
     if (original_dtype != torch::kFloat) {
         input_fp32 = input.to(torch::kFloat);
     }
 
-    // 获取维度
     auto sizes = input_fp32.sizes();
     TORCH_CHECK(sizes.size() == 3, "Input must be 3D [batch, seq_len, input_size]");
     int batch = sizes[0];
@@ -169,25 +159,23 @@ torch::Tensor bang_func(
     int input_size = sizes[2];
     int max_dim = std::max(input_size, hidden_size);
 
-    // 输出张量
+    // 检查维度是否超出 MAX_DIM
+    TORCH_CHECK(hidden_size <= MAX_DIM && input_size <= MAX_DIM,
+                "hidden_size and input_size must not exceed MAX_DIM (4096)");
+
     auto output_fp32 = torch::empty({batch, seq_len, hidden_size}, input_fp32.options());
 
-    // 临时缓冲区存储中间层输出 (num_layers-1 层)
     torch::Tensor temp_layers;
     if (num_layers > 1) {
         temp_layers = torch::empty({num_layers - 1, batch, seq_len, hidden_size}, input_fp32.options());
     } else {
-        temp_layers = torch::empty({0}, input_fp32.options()); // 占位
+        temp_layers = torch::empty({0}, input_fp32.options());
     }
 
-    // 获取MLU队列
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-
-    // 设置核函数启动维度 (使用所有可用核心)
-    cnrtDim3_t dim = {16, 1, 1};  // 16个核心
+    cnrtDim3_t dim = {16, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
-    // 启动核函数
     multi_layer_gru_kernel<<<dim, ktype, queue>>>(
         input_fp32.data_ptr<float>(),
         output_fp32.data_ptr<float>(),
@@ -203,10 +191,8 @@ torch::Tensor bang_func(
         max_dim
     );
 
-    // 同步队列
     cnrtQueueSync(queue);
 
-    // 转换回原始数据类型
     if (original_dtype != torch::kFloat) {
         return output_fp32.to(original_dtype);
     }
