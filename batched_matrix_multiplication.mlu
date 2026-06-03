@@ -76,15 +76,12 @@ __mlu_entry__ void batched_matmul_kernel(
                                  batch_B + (k_off + kk) * N + n_off,
                                  n_tile * sizeof(float), GDRAM2NRAM);
 
-                    // C += A @ B  (copy B row, in-place BANG mul_scalar, BANG add)
+                    // C += A @ B  (BANG vector mul_scalar + add, src ≠ dst)
                     for (uint32_t i = 0; i < m_tile; i++)
                         for (uint32_t kk = 0; kk < k_tile; kk++) {
                             float aik = nram_A[i][kk];
-                            // copy B[kk][:] to temp (256 scalar copies)
-                            for (uint32_t j = 0; j < n_tile; j++)
-                                nram_temp[j] = nram_B[kk][j];
-                            // temp[:] *= aik  (in-place, matches LeakyReLU pattern)
-                            __bang_mul_scalar(nram_temp, nram_temp, aik, ALIGNED_N);
+                            // temp[:] = aik * B[kk][:]   (vector op, no scalar copy)
+                            __bang_mul_scalar(nram_temp, nram_B[kk], aik, ALIGNED_N);
                             // C[i][:] += temp[:]
                             __bang_add(nram_C[i], nram_C[i], nram_temp, ALIGNED_N);
                         }
