@@ -1,15 +1,12 @@
-<｜｜DSML｜｜tool_calls>
-<｜｜DSML｜｜invoke name="Write">
-<｜｜DSML｜｜parameter name="file_path" string="true">C:/Users/jiang/Desktop/国科大/作业/智能计算系统/bangc/Human_Vs_AI/conv_transposed_2D__asymmetric_input__square_kernel.mlu</｜｜DSML｜｜parameter>
-<｜｜DSML｜｜parameter name="content" string="true">// conv_transposed_2D__asymmetric_input__square_kernel.cpp
+// conv_transposed_2D__asymmetric_input__square_kernel.cpp
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
 
 #define CIN_TILE 8
 #define COUT_TILE 8
-#define H_TILE 24
-#define W_TILE 24
+#define H_TILE 32
+#define W_TILE 32
 #define K 3
 #define H_EXT (H_TILE+K-1)
 #define W_EXT (W_TILE+K-1)
@@ -49,22 +46,62 @@ __mlu_entry__ void convtransp2d_kernel(
                     uint32_t wt = (wo + W_TILE <= WO) ? W_TILE : (WO - wo);
                     uint32_t we = wt + K - 1;
 
-                    // --- zero accumulator for this output tile ---
+                    // zero accumulator
                     for (uint32_t co = 0; co < cot; co++)
-                        for (uint32_t hi = 0; hi < ht; hi++)
-                            for (uint32_t wi = 0; wi < wt; wi++)
-                                na[co][hi][wi] = 0.0f;
+                        for (uint32_t i = 0; i < ht; i++)
+                            for (uint32_t j = 0; j < wt; j++)
+                                na[co][i][j] = 0.0f;
 
                     for (uint32_t ci_g = 0; ci_g < CI; ci_g += CIN_TILE) {
                         uint32_t cit = (ci_g + CIN_TILE <= CI) ? CIN_TILE : (CI - ci_g);
 
-                        // --- load kernel weights and input tile (per ci) ---
+                        // ===========================================
+                        // Phase 1: load input tiles for all ci
+                        // ===========================================
                         for (uint32_t ci = 0; ci < cit; ci++) {
                             uint32_t gci = ci_g + ci;
 
-                            // load flipped kernel weights  w[ci][co][K-1-kh][K-1-kw]
-                            for (uint32_t co = 0; co < cot; co++) {
-                                uint32_t gco = co_g + co;
+                            // zero the input tile
+                            for (uint32_t i = 0; i < he; i++)
+                                for (uint32_t j = 0; j < we; j++)
+                                    ni[ci][i][j] = 0.0f;
+
+                            // load valid region
+                            int prs = (int)ho;
+                            int pre = (int)(ho + he - 1);
+                            int vs = K - 1;
+                            int ve = K - 1 + HI - 1;
+                            int cs = (prs > vs) ? prs : vs;
+                            int ce = (pre < ve) ? pre : ve;
+
+                            for (int r = cs; r <= ce; r++) {
+                                int ir = r - (K - 1);     // input row index
+                                int pcs = (int)wo;
+                                int pce = (int)(wo + we - 1);
+                                int wvs = K - 1;
+                                int wve = K - 1 + WI - 1;
+                                int wcs = (pcs > wvs) ? pcs : wvs;
+                                int wce = (pce < wve) ? pce : wve;
+                                if (wcs <= wce)
+                                    __memcpy(
+                                        &ni[ci][r - (int)ho][wcs - (int)wo],
+                                        bin + gci * HI * WI
+                                            + ir * WI
+                                            + (wcs - (K - 1)),
+                                        (wce - wcs + 1) * sizeof(float),
+                                        GDRAM2NRAM);
+                            }
+                        }
+
+                        // ===========================================
+                        // Phase 2: for each co, load kernel then accumulate
+                        // ===========================================
+                        for (uint32_t co = 0; co < cot; co++) {
+                            uint32_t gco = co_g + co;
+
+                            // load flipped kernel for THIS output channel
+                            for (uint32_t ci = 0; ci < cit; ci++) {
+                                uint32_t gci = ci_g + ci;
                                 for (uint32_t kh = 0; kh < K; kh++)
                                     for (uint32_t kw = 0; kw < K; kw++)
                                         nk[ci][kh][kw] = kernel_gdr[
@@ -73,43 +110,7 @@ __mlu_entry__ void convtransp2d_kernel(
                                             + (K - 1 - kw)];
                             }
 
-                            // zero the input tile (K-1 zero-padding around valid region)
-                            for (uint32_t i = 0; i < he; i++)
-                                for (uint32_t j = 0; j < we; j++)
-                                    ni[ci][i][j] = 0.0f;
-
-                            // overlap of output-tile padded region [ho, ho+he-1]
-                            // with valid-input padded region [K-1, K-1+HI-1]
-                            int cs = ((int)ho > (K - 1)) ? (int)ho : (K - 1);
-                            int ce = ((int)(ho + he - 1) < (K - 1 + HI - 1))
-                                         ? (int)(ho + he - 1)
-                                         : (K - 1 + HI - 1);
-
-                            for (int r = cs; r <= ce; r++) {
-                                int ir = r - (K - 1);  // input row index
-
-                                int wcs = ((int)wo > (K - 1)) ? (int)wo : (K - 1);
-                                int wce = ((int)(wo + we - 1) < (K - 1 + WI - 1))
-                                              ? (int)(wo + we - 1)
-                                              : (K - 1 + WI - 1);
-
-                                if (wcs <= wce) {
-                                    int ni_r  = r   - (int)ho;
-                                    int ni_c0 = wcs - (int)wo;
-                                    int ncols = wce - wcs + 1;
-
-                                    // direct element load – avoids __memcpy alignment issues
-                                    float* src = bin + gci * HI * WI
-                                               + ir * WI
-                                               + (wcs - (K - 1));
-                                    for (int col = 0; col < ncols; col++)
-                                        ni[ci][ni_r][ni_c0 + col] = src[col];
-                                }
-                            }
-                        }
-
-                        // --- convolution: na[co][hi][wi] += wk * ni[ci][hi+kh][wi+kw] ---
-                        for (uint32_t co = 0; co < cot; co++)
+                            // accumulate for THIS output channel
                             for (uint32_t ci = 0; ci < cit; ci++)
                                 for (uint32_t kh = 0; kh < K; kh++)
                                     for (uint32_t kw = 0; kw < K; kw++) {
@@ -119,15 +120,20 @@ __mlu_entry__ void convtransp2d_kernel(
                                                 na[co][hi][wi] +=
                                                     wk * ni[ci][hi + kh][wi + kw];
                                     }
+                        }
                     }
 
-                    // --- store output tile ---
+                    // ===========================================
+                    // Store output tile
+                    // ===========================================
                     for (uint32_t co = 0; co < cot; co++) {
                         uint32_t gco = co_g + co;
                         for (uint32_t hi = 0; hi < ht; hi++)
-                            for (uint32_t wi = 0; wi < wt; wi++)
-                                bout[gco * HO * WO + (ho + hi) * WO + wo + wi] =
-                                    na[co][hi][wi];
+                            __memcpy(
+                                bout + gco * HO * WO + (ho + hi) * WO + wo,
+                                na[co][hi],
+                                wt * sizeof(float),
+                                NRAM2GDRAM);
                     }
                 }
             }
@@ -182,6 +188,3 @@ torch::Tensor bang_func(
         return ofp.to(odt);
     return ofp;
 }
-</｜｜DSML｜｜parameter>
-</｜｜DSML｜｜invoke>
-</｜｜DSML｜｜tool_calls>
