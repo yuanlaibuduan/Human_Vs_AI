@@ -9,9 +9,11 @@
 //   (__bang_mul_scalar + __bang_add), ~100x faster than scalar loop.
 //   NRAM: 64*64 + 64*256 + 64*256 + 256 = 42K floats = 168 KB.
 //   N=2048 is a multiple of TILE_N=256, so n_tile is always 256.
+//   ALIGNED_N is a compile-time constant required by BANG intrinsics.
 #define TILE_M 64
 #define TILE_N 256
 #define TILE_K 64
+#define ALIGNED_N 256
 
 // MLU kernel: batched matrix multiplication C = A @ B
 //   BANG vector intrinsics for inner SAXPY: C[i][:] += aik * B[kk][:]
@@ -36,10 +38,11 @@ __mlu_entry__ void batched_matmul_kernel(
     uint32_t my_batches = batches_per_core +
                           (core_id < batch_rem ? 1 : 0);
 
-    // NRAM tile buffers
+    // NRAM tile buffers + temp for SAXPY
     __nram__ float nram_A[TILE_M][TILE_K];
     __nram__ float nram_B[TILE_K][TILE_N];
     __nram__ float nram_C[TILE_M][TILE_N];
+    __nram__ float nram_temp[TILE_N];
 
     for (uint32_t b = 0; b < my_batches; b++) {
         uint32_t batch = start_batch + b;
@@ -73,12 +76,17 @@ __mlu_entry__ void batched_matmul_kernel(
                                  batch_B + (k_off + kk) * N + n_off,
                                  n_tile * sizeof(float), GDRAM2NRAM);
 
-                    // C += A @ B  (ikj order, scalar inner loop)
+                    // C += A @ B  (copy B row, in-place BANG mul_scalar, BANG add)
                     for (uint32_t i = 0; i < m_tile; i++)
                         for (uint32_t kk = 0; kk < k_tile; kk++) {
                             float aik = nram_A[i][kk];
+                            // copy B[kk][:] to temp (256 scalar copies)
                             for (uint32_t j = 0; j < n_tile; j++)
-                                nram_C[i][j] += aik * nram_B[kk][j];
+                                nram_temp[j] = nram_B[kk][j];
+                            // temp[:] *= aik  (in-place, matches LeakyReLU pattern)
+                            __bang_mul_scalar(nram_temp, nram_temp, aik, ALIGNED_N);
+                            // C[i][:] += temp[:]
+                            __bang_add(nram_C[i], nram_C[i], nram_temp, ALIGNED_N);
                         }
                 }
 
