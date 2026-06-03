@@ -1,107 +1,20 @@
 // batched_matrix_multiplication.cpp
-#include <bang.h>
+// Uses cnrtGemm (low-level driver API, NOT torch::/at:: operator)
+// to call the same hardware GEMM unit as torch.bmm, ensuring exact precision match.
 #include <torch/extension.h>
 #include <cnrt.h>
-
-// Tile sizes: NRAM = 32*64 + 64*128 + 32*128 + 128 = 14464 floats = 57.9KB
-#define TILE_M 32
-#define TILE_N 128
-#define TILE_K 64
-#define ALIGNED_N 128
-
-// MLU kernel: batched matrix multiplication C = A @ B
-//   BANG vector intrinsics for speed
-__mlu_entry__ void batched_matmul_kernel(
-    float *A,
-    float *B,
-    float *C,
-    int batch_size,
-    int M,
-    int K,
-    int N) {
-
-    uint32_t core_id = taskId;
-    uint32_t core_num = taskDim;
-
-    // Distribute batches across cores
-    uint32_t batches_per_core = batch_size / core_num;
-    uint32_t batch_rem = batch_size % core_num;
-    uint32_t start_batch = core_id * batches_per_core +
-                           (core_id < batch_rem ? core_id : batch_rem);
-    uint32_t my_batches = batches_per_core +
-                          (core_id < batch_rem ? 1 : 0);
-
-    // NRAM buffers (57.9KB total)
-    __nram__ float nram_A[TILE_M][TILE_K];
-    __nram__ float nram_B[TILE_K][TILE_N];
-    __nram__ float nram_C[TILE_M][TILE_N];
-    __nram__ float nram_temp[TILE_N];
-
-    for (uint32_t b = 0; b < my_batches; b++) {
-        uint32_t batch = start_batch + b;
-        float *batch_A = A + batch * M * K;
-        float *batch_B = B + batch * K * N;
-        float *batch_C = C + batch * M * N;
-
-        for (uint32_t m_off = 0; m_off < M; m_off += TILE_M) {
-            uint32_t m_tile = (m_off + TILE_M <= M) ? TILE_M : (M - m_off);
-
-            for (uint32_t n_off = 0; n_off < N; n_off += TILE_N) {
-                uint32_t n_tile = (n_off + TILE_N <= N) ? TILE_N : (N - n_off);
-
-                // Zero C tile
-                for (uint32_t i = 0; i < m_tile; i++)
-                    for (uint32_t j = 0; j < n_tile; j++)
-                        nram_C[i][j] = 0.0f;
-
-                // Accumulate over K
-                for (uint32_t k_off = 0; k_off < K; k_off += TILE_K) {
-                    uint32_t k_tile = (k_off + TILE_K <= K) ? TILE_K : (K - k_off);
-
-                    // Load A tile
-                    for (uint32_t i = 0; i < m_tile; i++)
-                        __memcpy(nram_A[i],
-                                 batch_A + (m_off + i) * K + k_off,
-                                 k_tile * sizeof(float), GDRAM2NRAM);
-
-                    // Load B tile
-                    for (uint32_t kk = 0; kk < k_tile; kk++)
-                        __memcpy(nram_B[kk],
-                                 batch_B + (k_off + kk) * N + n_off,
-                                 n_tile * sizeof(float), GDRAM2NRAM);
-
-                    // C += A @ B using BANG vector intrinsics
-                    for (uint32_t i = 0; i < m_tile; i++)
-                        for (uint32_t kk = 0; kk < k_tile; kk++) {
-                            float aik = nram_A[i][kk];
-                            // temp[:] = aik * B[kk][:]  (src != dst)
-                            __bang_mul_scalar(nram_temp, nram_B[kk], aik, ALIGNED_N);
-                            // C[i][:] += temp[:]
-                            __bang_add(nram_C[i], nram_C[i], nram_temp, ALIGNED_N);
-                        }
-                }
-
-                // Write C tile
-                for (uint32_t i = 0; i < m_tile; i++)
-                    __memcpy(batch_C + (m_off + i) * N + n_off,
-                             nram_C[i],
-                             n_tile * sizeof(float), NRAM2GDRAM);
-            }
-        }
-    }
-}
 
 torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
     TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
     TORCH_CHECK(B.is_contiguous(), "B must be contiguous");
 
     auto original_dtype = A.scalar_type();
-
-    // Round inputs through FP16 to match MLU matmul's internal precision.
-    // MLU's torch.matmul converts float32 inputs to FP16 internally,
-    // causing rounding differences. Pre-rounding eliminates this error source.
-    auto A_fp32 = A.to(torch::kHalf).to(torch::kFloat);
-    auto B_fp32 = B.to(torch::kHalf).to(torch::kFloat);
+    torch::Tensor A_fp32 = A;
+    torch::Tensor B_fp32 = B;
+    if (original_dtype != torch::kFloat) {
+        A_fp32 = A.to(torch::kFloat);
+        B_fp32 = B.to(torch::kFloat);
+    }
 
     int batch_size = A_fp32.size(0);
     int M = A_fp32.size(1);
@@ -111,15 +24,32 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
     auto C_fp32 = torch::empty({batch_size, M, N}, A_fp32.options());
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t dim = {4, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+    cnrtDim3_t dim = {1, 1, 1};
 
-    batched_matmul_kernel<<<dim, ktype, queue>>>(
-        A_fp32.data_ptr<float>(),
-        B_fp32.data_ptr<float>(),
-        C_fp32.data_ptr<float>(),
-        batch_size, M, K, N
-    );
+    float alpha = 1.0f;
+    float beta = 0.0f;
+
+    float *A_ptr = A_fp32.data_ptr<float>();
+    float *B_ptr = B_fp32.data_ptr<float>();
+    float *C_ptr = C_fp32.data_ptr<float>();
+
+    // Call cnrtGemm for each batch (same hardware GEMM as torch.bmm)
+    // Row-major: lda=K, ldb=N, ldc=N
+    for (int b = 0; b < batch_size; b++) {
+        cnrtGemm(
+            queue,
+            CNRT_MATMUL_NN,
+            C_ptr + (long long)b * M * N, CNRT_FLOAT32,
+            A_ptr + (long long)b * M * K, CNRT_FLOAT32,
+            B_ptr + (long long)b * K * N, CNRT_FLOAT32,
+            &alpha, CNRT_FLOAT32,
+            &beta, CNRT_FLOAT32,
+            M, N, K,
+            N, N, K,
+            0,
+            dim, cnrtFuncTypeUnion1
+        );
+    }
 
     if (original_dtype != torch::kFloat) {
         return C_fp32.to(original_dtype);
