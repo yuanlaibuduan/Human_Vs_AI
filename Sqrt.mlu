@@ -1,0 +1,77 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define CHUNK_SIZE 4096  // 每次处理的数据量 (float个数)
+
+// 核函数：逐元素 sqrt(abs(x))
+__mlu_entry__ void sqrt_abs_kernel(float *input, float *output, int total) {
+    // 获取当前核信息
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+    
+    // 数据划分：每个核处理大致相等的元素，余数部分分配给前几个核
+    uint32_t per_core = total / core_num;
+    uint32_t remainder = total % core_num;
+    uint32_t start = core_id * per_core + (core_id < remainder ? core_id : remainder);
+    uint32_t count = per_core + (core_id < remainder ? 1 : 0);
+    
+    // NRAM 缓冲区
+    __nram__ float nram_data[CHUNK_SIZE];
+    
+    // 分块处理
+    for (uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
+        uint32_t len = (offset + CHUNK_SIZE <= count) ? CHUNK_SIZE : (count - offset);
+        uint32_t aligned_len = (len + 63) & ~63;  // 对齐到 64 字节 (16 个 float)
+        
+        // 从 GDRAM 拷贝到 NRAM
+        __memcpy(nram_data, input + start + offset, len * sizeof(float), GDRAM2NRAM);
+        
+        // 逐元素绝对值
+        __bang_active_abs(nram_data, nram_data, aligned_len);
+        // 逐元素平方根
+        __bang_active_sqrt(nram_data, nram_data, aligned_len);
+        
+        // 写回 GDRAM
+        __memcpy(output + start + offset, nram_data, len * sizeof(float), NRAM2GDRAM);
+    }
+}
+
+// 对外接口函数
+torch::Tensor bang_func(torch::Tensor input) {
+    // 检查输入是否连续
+    TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
+    
+    // 保留原始数据类型
+    auto original_dtype = input.scalar_type();
+    
+    // 转换为 float32 计算
+    torch::Tensor input_fp32 = input;
+    if (original_dtype != torch::kFloat) {
+        input_fp32 = input.to(torch::kFloat);
+    }
+    
+    // 分配输出张量 (float32)
+    auto output_fp32 = torch::empty_like(input_fp32);
+    
+    int total = input_fp32.numel();
+    
+    // 获取当前 MLU 流队列 (禁止新建队列)
+    cnrtQueue_t queue = torch_mlu::getCurMLUstream();
+    
+    // 启动核函数：4 个 Union1 类型核
+    cnrtDim3_t dim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+    
+    sqrt_abs_kernel<<<dim, ktype, queue>>>(
+        input_fp32.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
+        total
+    );
+    
+    // 若原始类型不是 float32，则转回原始类型
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
+    }
+    return output_fp32;
+}
