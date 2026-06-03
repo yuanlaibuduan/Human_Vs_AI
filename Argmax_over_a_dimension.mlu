@@ -1,0 +1,94 @@
+// Argmax_over_a_dimension.cpp
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define CHUNK_SIZE 256
+
+// MLU kernel: argmax along dim=1 for input [B, D1, D2]
+//   Input: [batch_size, dim1, dim2] = [16, 256, 256]
+//   Output: [batch_size, dim2] = [16, 256]
+//   Each output[b][j] = index of max in input[b][0:dim1][j]
+__mlu_entry__ void argmax_kernel(
+    float *input,
+    float *output,
+    int batch_size,
+    int dim1,
+    int dim2) {
+
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+
+    // Distribute batches across cores
+    uint32_t batches_per_core = batch_size / core_num;
+    uint32_t batch_rem = batch_size % core_num;
+    uint32_t start_batch = core_id * batches_per_core +
+                           (core_id < batch_rem ? core_id : batch_rem);
+    uint32_t my_batches = batches_per_core +
+                          (core_id < batch_rem ? 1 : 0);
+
+    // NRAM buffer for one column along dim1
+    __nram__ float nram_col[CHUNK_SIZE];
+
+    for (uint32_t b = 0; b < my_batches; b++) {
+        uint32_t batch = start_batch + b;
+        float *batch_input = input + batch * dim1 * dim2;
+
+        for (uint32_t j = 0; j < dim2; j++) {
+            // Load column input[b][0:dim1][j] into NRAM
+            // Input is row-major: [dim1, dim2], so input[b][k][j] = input[k*dim2 + j]
+            for (uint32_t k = 0; k < dim1; k++) {
+                nram_col[k] = batch_input[k * dim2 + j];
+            }
+
+            // Find argmax: index of maximum value in nram_col[0..dim1-1]
+            float max_val = nram_col[0];
+            uint32_t arg_idx = 0;
+            for (uint32_t k = 1; k < dim1; k++) {
+                if (nram_col[k] > max_val) {
+                    max_val = nram_col[k];
+                    arg_idx = k;
+                }
+            }
+
+            // Write result as float (integer index 0..255)
+            output[batch * dim2 + j] = (float)arg_idx;
+        }
+    }
+}
+
+// C++ wrapper called by PyTorch
+torch::Tensor bang_func(torch::Tensor x, int dim) {
+    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
+    // argmax only implemented for dim=1
+    TORCH_CHECK(dim == 1, "Argmax: only dim=1 is supported, got dim=", dim);
+
+    // Preserve original data type
+    auto original_dtype = x.scalar_type();
+    torch::Tensor input_fp32 = x;
+    if (original_dtype != torch::kFloat) {
+        input_fp32 = x.to(torch::kFloat);
+    }
+
+    int batch_size = input_fp32.size(0);
+    int dim1 = input_fp32.size(1);
+    int dim2 = input_fp32.size(2);
+
+    auto output_fp32 = torch::empty({batch_size, dim2}, input_fp32.options());
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    cnrtDim3_t cnrt_dim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    argmax_kernel<<<cnrt_dim, ktype, queue>>>(
+        input_fp32.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
+        batch_size, dim1, dim2
+    );
+
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
+    }
+    return output_fp32;
+}
