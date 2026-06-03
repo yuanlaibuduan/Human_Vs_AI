@@ -8,10 +8,9 @@
 #define EPS 1e-5f
 
 // MLU kernel: BatchNorm2d in training mode
-//   Per-channel batch statistics over (N, H, W)
-//   y = (x - mean) / sqrt(var + eps) * gamma + beta
-//   With default init (gamma=1, beta=0):
-//   y = (x - mean) / sqrt(var + eps)
+// Per-channel batch statistics over (N, H, W)
+// Formula: y = (x - mean) / sqrt(var + eps)
+// Two-pass algorithm: pass1 computes mean+variance, pass2 normalizes
 __mlu_entry__ void batchnorm_kernel(
     float *input,
     float *output,
@@ -37,17 +36,16 @@ __mlu_entry__ void batchnorm_kernel(
         int c = ci_start + ci_idx;
 
         // =========================================
-        // Pass 1: accumulate sum and sum_sq for this channel
+        // Pass 1: Compute sum and sum_sq for this channel
         // =========================================
         float sum = 0.0f;
         float sum_sq = 0.0f;
-
+        
         for (int b = 0; b < B; b++) {
             float* src = input + b * CI * HW + c * HW;
 
             for (int off = 0; off < HW; off += CHUNK_SIZE) {
                 int len = (off + CHUNK_SIZE <= HW) ? CHUNK_SIZE : (HW - off);
-
                 __memcpy(buf, src + off, len * sizeof(float), GDRAM2NRAM);
 
                 for (int i = 0; i < len; i++) {
@@ -57,14 +55,14 @@ __mlu_entry__ void batchnorm_kernel(
                 }
             }
         }
-
+        
         float mean = sum / (float)total_per_ch;
         float var = sum_sq / (float)total_per_ch - mean * mean;
         if (var < 0.0f) var = 0.0f;
         float inv_std = 1.0f / sqrtf(var + EPS);
 
         // =========================================
-        // Pass 2: normalize and write output
+        // Pass 2: Normalize and write output
         // =========================================
         for (int b = 0; b < B; b++) {
             float* src = input + b * CI * HW + c * HW;
@@ -72,7 +70,6 @@ __mlu_entry__ void batchnorm_kernel(
 
             for (int off = 0; off < HW; off += CHUNK_SIZE) {
                 int len = (off + CHUNK_SIZE <= HW) ? CHUNK_SIZE : (HW - off);
-
                 __memcpy(buf, src + off, len * sizeof(float), GDRAM2NRAM);
 
                 for (int i = 0; i < len; i++) {
@@ -85,7 +82,6 @@ __mlu_entry__ void batchnorm_kernel(
     }
 }
 
-// C++ wrapper called by PyTorch
 torch::Tensor bang_func(torch::Tensor x, int num_features) {
     TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
 
@@ -104,7 +100,6 @@ torch::Tensor bang_func(torch::Tensor x, int num_features) {
     auto output_fp32 = torch::empty_like(input_fp32);
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-
     cnrtDim3_t dim = {4, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 

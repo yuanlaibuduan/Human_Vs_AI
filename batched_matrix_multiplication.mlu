@@ -3,16 +3,13 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
-// Optimized tile sizes to fit within NRAM (128KB limit)
-// NRAM usage: 32*32 + 32*128 + 32*128 = 1024 + 4096 + 4096 = 9216 floats = 36.9KB
-// This prevents NRAM overflow that caused 5.9s timeout and FP16 precision loss
+// Optimized for FP32 precision using scalar operations
+// Problem: C[128, 512, 2048] = A[128, 512, 1024] @ B[128, 1024, 2048]
+// NRAM usage: 32*64 + 64*128 + 32*128 = 14,336 floats = 57KB
 #define TILE_M 32
 #define TILE_N 128
-#define TILE_K 32
+#define TILE_K 64
 
-// MLU kernel: batched matrix multiplication C = A @ B
-// Uses scalar float32 FMA for precision (avoids BANG FP16 ALU)
-// Small tiles prevent NRAM overflow (36.9KB << 128KB)
 __mlu_entry__ void batched_matmul_kernel(
     float *A,
     float *B,
@@ -33,7 +30,7 @@ __mlu_entry__ void batched_matmul_kernel(
     uint32_t my_batches = batches_per_core +
                           (core_id < batch_rem ? 1 : 0);
 
-    // NRAM tile buffers (36.9KB total, well within 128KB limit)
+    // NRAM buffers for tiled computation
     __nram__ float nram_A[TILE_M][TILE_K];
     __nram__ float nram_B[TILE_K][TILE_N];
     __nram__ float nram_C[TILE_M][TILE_N];
@@ -51,7 +48,7 @@ __mlu_entry__ void batched_matmul_kernel(
             for (uint32_t n_off = 0; n_off < N; n_off += TILE_N) {
                 uint32_t n_tile = (n_off + TILE_N <= N) ? TILE_N : (N - n_off);
 
-                // Zero-initialize C tile in NRAM
+                // Zero C tile
                 for (uint32_t i = 0; i < m_tile; i++)
                     for (uint32_t j = 0; j < n_tile; j++)
                         nram_C[i][j] = 0.0f;
@@ -60,44 +57,47 @@ __mlu_entry__ void batched_matmul_kernel(
                 for (uint32_t k_off = 0; k_off < K; k_off += TILE_K) {
                     uint32_t k_tile = (k_off + TILE_K <= K) ? TILE_K : (K - k_off);
 
-                    // Load A tile from GDRAM to NRAM
+                    // Load A tile: [m_off:m_off+m_tile, k_off:k_off+k_tile]
                     for (uint32_t i = 0; i < m_tile; i++) {
                         __memcpy(nram_A[i],
                                  batch_A + (m_off + i) * K + k_off,
-                                 k_tile * sizeof(float), GDRAM2NRAM);
+                                 k_tile * sizeof(float),
+                                 GDRAM2NRAM);
                     }
 
-                    // Load B tile from GDRAM to NRAM
+                    // Load B tile: [k_off:k_off+k_tile, n_off:n_off+n_tile]
                     for (uint32_t kk = 0; kk < k_tile; kk++) {
                         __memcpy(nram_B[kk],
                                  batch_B + (k_off + kk) * N + n_off,
-                                 n_tile * sizeof(float), GDRAM2NRAM);
+                                 n_tile * sizeof(float),
+                                 GDRAM2NRAM);
                     }
 
-                    // Compute C += A @ B using scalar float32 FMA
-                    // This guarantees FP32 precision (no BANG FP16 ALU rounding)
+                    // Compute: C[i][j] += sum_k(A[i][k] * B[k][j])
+                    // Scalar FP32 FMA for full precision
                     for (uint32_t i = 0; i < m_tile; i++) {
-                        for (uint32_t kk = 0; kk < k_tile; kk++) {
-                            float aik = nram_A[i][kk];
-                            for (uint32_t j = 0; j < n_tile; j++) {
-                                nram_C[i][j] += aik * nram_B[kk][j];
+                        for (uint32_t j = 0; j < n_tile; j++) {
+                            float sum = 0.0f;
+                            for (uint32_t kk = 0; kk < k_tile; kk++) {
+                                sum += nram_A[i][kk] * nram_B[kk][j];
                             }
+                            nram_C[i][j] += sum;
                         }
                     }
                 }
 
-                // Write C tile from NRAM to GDRAM
+                // Write C tile back to global memory
                 for (uint32_t i = 0; i < m_tile; i++) {
                     __memcpy(batch_C + (m_off + i) * N + n_off,
                              nram_C[i],
-                             n_tile * sizeof(float), NRAM2GDRAM);
+                             n_tile * sizeof(float),
+                             NRAM2GDRAM);
                 }
             }
         }
     }
 }
 
-// C++ wrapper called by PyTorch
 torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
     TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
     TORCH_CHECK(B.is_contiguous(), "B must be contiguous");
@@ -115,10 +115,8 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
     int K = A_fp32.size(2);
     int N = B_fp32.size(2);
 
-    // Allocate output
     auto C_fp32 = torch::empty({batch_size, M, N}, A_fp32.options());
 
-    // Launch kernel
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t dim = {4, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
@@ -130,7 +128,6 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
         batch_size, M, K, N
     );
 
-    // Convert back to original dtype if needed
     if (original_dtype != torch::kFloat) {
         return C_fp32.to(original_dtype);
     }
