@@ -4,20 +4,15 @@
 #include <cnrt.h>
 
 // Tile sizes tuned for [512, 1024] x [1024, 2048]:
-//   TILE_N is made large (256) to reduce __memcpy call count.
-//   Inner SAXPY C[i][:] += aik * B[kk][:] uses BANG vector intrinsics
-//   (__bang_mul_scalar + __bang_add), ~100x faster than scalar loop.
-//   NRAM: 64*64 + 64*256 + 64*256 + 256 = 42K floats = 168 KB.
-//   N=2048 is a multiple of TILE_N=256, so n_tile is always 256.
-//   ALIGNED_N is a compile-time constant required by BANG intrinsics.
+//   Scalar float32 FMA inner loop for precision.
+//   NRAM: 64*64 + 64*256 + 64*256 = 37K floats = 148 KB.
 #define TILE_M 64
 #define TILE_N 256
 #define TILE_K 64
-#define ALIGNED_N 256
 
 // MLU kernel: batched matrix multiplication C = A @ B
-//   BANG vector intrinsics for inner SAXPY: C[i][:] += aik * B[kk][:]
-//   replaces the scalar triple loop, exploiting MLU SIMD on NRAM.
+//   Scalar float32 FMA inner loop – avoids FP16 precision loss
+//   from BANG vector ALU on compute_30.
 __mlu_entry__ void batched_matmul_kernel(
     float *A,
     float *B,
@@ -38,11 +33,10 @@ __mlu_entry__ void batched_matmul_kernel(
     uint32_t my_batches = batches_per_core +
                           (core_id < batch_rem ? 1 : 0);
 
-    // NRAM tile buffers + temp for SAXPY
+    // NRAM tile buffers (scalar float32 FMAs for precision)
     __nram__ float nram_A[TILE_M][TILE_K];
     __nram__ float nram_B[TILE_K][TILE_N];
     __nram__ float nram_C[TILE_M][TILE_N];
-    __nram__ float nram_temp[TILE_N];
 
     for (uint32_t b = 0; b < my_batches; b++) {
         uint32_t batch = start_batch + b;
@@ -76,14 +70,12 @@ __mlu_entry__ void batched_matmul_kernel(
                                  batch_B + (k_off + kk) * N + n_off,
                                  n_tile * sizeof(float), GDRAM2NRAM);
 
-                    // C += A @ B  (BANG vector mul_scalar + add, src ≠ dst)
+                    // C += A @ B  (scalar float32 FMA – avoids FP16 vector ALU precision loss)
                     for (uint32_t i = 0; i < m_tile; i++)
                         for (uint32_t kk = 0; kk < k_tile; kk++) {
                             float aik = nram_A[i][kk];
-                            // temp[:] = aik * B[kk][:]   (vector op, no scalar copy)
-                            __bang_mul_scalar(nram_temp, nram_B[kk], aik, ALIGNED_N);
-                            // C[i][:] += temp[:]
-                            __bang_add(nram_C[i], nram_C[i], nram_temp, ALIGNED_N);
+                            for (uint32_t j = 0; j < n_tile; j++)
+                                nram_C[i][j] += aik * nram_B[kk][j];
                         }
                 }
 
