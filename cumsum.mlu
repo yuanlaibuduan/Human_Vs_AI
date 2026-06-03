@@ -1,0 +1,127 @@
+// 051_cumsum.cpp
+#include <bang.h>
+#include <cnrt.h>
+#include <torch/extension.h>
+
+#define CHUNK_SIZE 4096
+
+/**
+ * BangC 核函数：沿指定维度计算累加前缀和（FP32）
+ *
+ * @param input       输入张量指针（FP32，连续内存）
+ * @param output      输出张量指针（FP32，连续内存）
+ * @param size_dim    扫描维度的大小
+ * @param inner_size  扫描维度之后各维度元素数的乘积（步长）
+ * @param outer_size  扫描维度之前各维度元素数的乘积
+ * @param total_sequences  总的独立序列个数，等于 outer_size * inner_size
+ */
+__mlu_entry__ void cumsum_kernel(
+    float* input,
+    float* output,
+    int size_dim,
+    int inner_size,
+    int outer_size,
+    int total_sequences) {
+
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+
+    // 将总序列数均匀分配给各核
+    uint32_t per_core = total_sequences / core_num;
+    uint32_t rem = total_sequences % core_num;
+    uint32_t seq_start = core_id * per_core + (core_id < rem ? core_id : rem);
+    uint32_t seq_count = per_core + (core_id < rem ? 1 : 0);
+
+    // 每个核处理自己负责的序列
+    for (uint32_t seq = 0; seq < seq_count; ++seq) {
+        uint32_t seq_idx = seq_start + seq;
+
+        // 分解序列索引为 outer_idx 和 inner_idx
+        uint32_t outer_idx = seq_idx / inner_size;
+        uint32_t inner_idx = seq_idx % inner_size;
+
+        // 当前序列的第一个元素地址（对应 i_dim = 0）
+        float* seq_input = input + (outer_idx * size_dim * inner_size + inner_idx);
+        float* seq_output = output + (outer_idx * size_dim * inner_size + inner_idx);
+
+        float accum = 0.0f;
+        // 串行遍历该序列的所有元素，步长为 inner_size
+        for (int i = 0; i < size_dim; ++i) {
+            float val = seq_input[i * inner_size];
+            accum += val;
+            seq_output[i * inner_size] = accum;
+        }
+    }
+}
+
+/**
+ * 外部调用接口：对输入张量沿指定维度计算累加前缀和
+ *
+ * @param x    输入张量，支持任意类型（内部转为 FP32 计算）
+ * @param dim  需要扫描的维度（支持负数索引，如 -1 表示最后一维）
+ * @return     与 x 形状相同的输出张量
+ */
+torch::Tensor bang_func(torch::Tensor x, int dim) {
+    // 确保输入张量在 MLU 上且连续
+    x = x.contiguous();
+    auto original_dtype = x.scalar_type();
+
+    // 转换为 FP32 进行计算
+    torch::Tensor input_fp32 = x;
+    if (original_dtype != torch::kFloat) {
+        input_fp32 = x.to(torch::kFloat);
+    }
+
+    // 获取张量形状
+    auto sizes = input_fp32.sizes();
+    int64_t ndim = sizes.size();
+
+    // 处理负数维度
+    if (dim < 0) {
+        dim += ndim;
+    }
+    TORCH_CHECK(dim >= 0 && dim < ndim, "Invalid dim: ", dim,
+                " for tensor with ", ndim, " dimensions");
+
+    // 计算 outer_size（dim 之前维度的乘积）
+    int64_t outer_size = 1;
+    for (int i = 0; i < dim; ++i) {
+        outer_size *= sizes[i];
+    }
+
+    // 计算 inner_size（dim 之后维度的乘积），也就是扫描维度上相邻元素的步长
+    int64_t inner_size = 1;
+    for (size_t i = dim + 1; i < sizes.size(); ++i) {
+        inner_size *= sizes[i];
+    }
+
+    int64_t size_dim = sizes[dim];                // 扫描维度的长度
+    int64_t total_sequences = outer_size * inner_size; // 独立序列个数
+
+    // 分配输出张量
+    auto output_fp32 = torch::empty_like(input_fp32);
+
+    // 获取当前 MLU 流（队列）
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    // 设置核函数启动参数（使用 128 个核，可根据需要调整）
+    uint32_t core_num = 128;
+    cnrtDim3_t dim_grid = {core_num, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    // 启动核函数
+    cumsum_kernel<<<dim_grid, ktype, queue>>>(
+        input_fp32.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
+        static_cast<int>(size_dim),
+        static_cast<int>(inner_size),
+        static_cast<int>(outer_size),
+        static_cast<int>(total_sequences)
+    );
+
+    // 将结果转换回原始数据类型
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
+    }
+    return output_fp32;
+}
