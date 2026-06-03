@@ -88,8 +88,8 @@ torch::Tensor bang_func(
 
     // 输出形状 [tokens * top_k, hidden_size]
     int64_t out_rows = tokens * top_k;
-    auto out_fp32 = torch::empty({out_rows, hidden_size},
-                                 torch::dtype(torch::kFloat).device(x.device()));
+    // 使用 x_fp32.options() 继承 dtype 和 device，避免直接调用 torch::dtype 和 torch::device
+    auto out_fp32 = torch::empty({out_rows, hidden_size}, x_fp32.options());
 
     // 获取 MLU 队列
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();

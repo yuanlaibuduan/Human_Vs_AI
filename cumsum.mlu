@@ -3,78 +3,84 @@
 #include <cnrt.h>
 #include <torch/extension.h>
 
-#define MAX_NRAM_FLOATS (128 * 1024 / sizeof(float))  // 假设每核 NRAM 128KB
-#define BLOCK_SIZE      1024                          // 分块大小（64 的倍数）
-
-// 辅助函数：计算对齐长度（不小于 len 的最小 64 倍数）
-static inline uint32_t align_up(uint32_t x) {
-    return (x + 63) & ~63;
-}
+#define BLOCK_SIZE 1024  // 必须为 64 的倍数，且不超过 NRAM 容量（128KB / 4B = 32768）
 
 /**
- * BangC 核函数：沿指定维度计算累加前缀和。
- * 支持任意步长（inner_stride），自动分块处理。
+ * BangC 核函数：沿指定维度计算累加前缀和（FP32）
+ * 
+ * @param input        输入张量指针（FP32，连续内存）
+ * @param output       输出张量指针（FP32，连续内存）
+ * @param size_dim     扫描维度的大小
+ * @param inner_stride 扫描维度上相邻元素的步长（以元素个数计）
+ * @param outer_size   扫描维度之前各维度元素数的乘积（即外循环次数）
  */
 __mlu_entry__ void cumsum_kernel(
     float* input,
     float* output,
-    int size_dim,            // 扫描维度的长度
-    int inner_stride,        // 相邻元素的步长（以元素个数计）
-    int outer_stride,        // 不同序列之间的步长（= size_dim * inner_stride）
-    int total_sequences      // 独立序列个数
-) {
-    uint32_t core_id   = taskId;
-    uint32_t core_num  = taskDim;
+    int size_dim,
+    int inner_stride,
+    int outer_size) {
+    
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
 
-    // 序列均匀分配给各核
+    // 总序列数 = outer_size * inner_stride
+    int total_sequences = outer_size * inner_stride;
+    
+    // 将序列均匀分配给各核
     uint32_t per_core = total_sequences / core_num;
-    uint32_t rem      = total_sequences % core_num;
+    uint32_t rem = total_sequences % core_num;
     uint32_t seq_start = core_id * per_core + (core_id < rem ? core_id : rem);
     uint32_t seq_count = per_core + (core_id < rem ? 1 : 0);
 
+    // 固定大小的 NRAM 缓冲区
+    __nram__ float nram_data[BLOCK_SIZE];
+    __nram__ float nram_scan[BLOCK_SIZE];
+
     for (uint32_t s = 0; s < seq_count; ++s) {
         uint32_t seq_idx = seq_start + s;
-        // 该序列的起始偏移（元素为单位）
-        uint32_t base_offset = seq_idx * outer_stride;
-
-        uint32_t remaining = size_dim;
-        uint32_t offset = 0;
+        // 分解 seq_idx 为 outer 和 inner 索引
+        int outer = seq_idx / inner_stride;
+        int inner = seq_idx % inner_stride;
+        
+        // 计算当前序列的起始偏移（元素索引）
+        int base_offset = outer * size_dim * inner_stride + inner;
+        
         float global_acc = 0.0f;
-
+        int offset = 0;
+        int remaining = size_dim;
+        
         while (remaining > 0) {
-            uint32_t len = (remaining < BLOCK_SIZE) ? remaining : BLOCK_SIZE;
-            uint32_t aligned_len = align_up(len);
-
-            // NRAM 缓冲区：存放当前块的数据（连续）和扫描结果
-            __nram__ float nram_data[aligned_len];
-            __nram__ float nram_scan[aligned_len];
-
-            // 1. 从全局内存按步长 gather 到 NRAM
+            int len = (remaining < BLOCK_SIZE) ? remaining : BLOCK_SIZE;
+            int aligned_len = (len + 63) & ~63;  // 对齐到 64 的倍数
+            
+            // 从全局内存 gather 数据到 NRAM（步长加载）
             __memcpy_stride(
-                nram_data,                       // dst
+                nram_data,                           // dst (连续)
                 input + base_offset + offset * inner_stride,  // src
-                sizeof(float),                   // dst_stride (连续)
-                inner_stride * sizeof(float),    // src_stride
-                len,                             // 元素个数
+                sizeof(float),                      // dst_stride (连续)
+                inner_stride * sizeof(float),       // src_stride
+                len,                                // 元素个数
                 GDRAM2NRAM
             );
-
-            // 2. 计算块内前缀和（注意：__bang_scan_add 要求长度对齐）
+            
             if (len == aligned_len) {
+                // 满块：使用向量扫描指令
                 __bang_scan_add(nram_scan, nram_data, aligned_len, 1);
             } else {
-                // 长度不对齐时，先用标量循环计算扫描（最后一个块通常很小）
+                // 最后一个不足对齐的块：使用标量循环
                 float acc = 0.0f;
-                for (uint32_t i = 0; i < len; ++i) {
+                for (int i = 0; i < len; ++i) {
                     acc += nram_data[i];
                     nram_scan[i] = acc;
                 }
+                // 剩余元素（对齐填充部分）无需处理
             }
-
-            // 3. 加上全局累加值（向量化加标量）
+            
+            // 加上全局累加值（向量化加标量）
             __bang_add_scalar(nram_scan, nram_scan, global_acc, aligned_len);
-
-            // 4. 将结果按步长 scatter 回全局内存
+            
+            // 将结果 scatter 回全局内存
             __memcpy_stride(
                 output + base_offset + offset * inner_stride,
                 nram_scan,
@@ -83,10 +89,10 @@ __mlu_entry__ void cumsum_kernel(
                 len,
                 NRAM2GDRAM
             );
-
-            // 5. 更新全局累加值（取当前块最后一个元素）
+            
+            // 更新全局累加值（取当前块最后一个元素）
             global_acc = nram_scan[len - 1];
-
+            
             // 推进到下一个块
             remaining -= len;
             offset += len;
@@ -94,57 +100,58 @@ __mlu_entry__ void cumsum_kernel(
     }
 }
 
+/**
+ * 外部调用接口：对输入张量沿指定维度计算累加前缀和
+ * 
+ * @param x    输入张量（支持任意类型，内部转为 FP32 计算）
+ * @param dim  需要扫描的维度（支持负数索引）
+ * @return     与 x 形状相同的输出张量
+ */
 torch::Tensor bang_func(torch::Tensor x, int dim) {
-    // 输入检查和预处理
+    // 确保输入在 MLU 上且连续
     x = x.contiguous();
     auto original_dtype = x.scalar_type();
+    
+    // 转换为 FP32 计算（保持精度）
     torch::Tensor input_fp32 = (original_dtype == torch::kFloat) ? x : x.to(torch::kFloat);
-
+    
     auto sizes = input_fp32.sizes();
     int64_t ndim = sizes.size();
-
-    // 负数维度转换
+    
+    // 处理负数维度
     if (dim < 0) dim += ndim;
     TORCH_CHECK(dim >= 0 && dim < ndim, "Invalid dim");
-
-    // 计算 outer_stride（不同序列之间的步长）
-    int64_t outer_stride = 1;
-    for (int64_t i = dim; i < ndim; ++i) {
-        outer_stride *= sizes[i];
-    }
-    // inner_stride（同一序列内相邻元素的步长）
+    
+    // 计算 outer_size（dim 之前所有维度的乘积）
+    int64_t outer_size = 1;
+    for (int i = 0; i < dim; ++i) outer_size *= sizes[i];
+    
+    // 计算 inner_stride（dim 之后所有维度的乘积）
     int64_t inner_stride = 1;
-    for (int64_t i = dim + 1; i < ndim; ++i) {
-        inner_stride *= sizes[i];
-    }
+    for (size_t i = dim + 1; i < sizes.size(); ++i) inner_stride *= sizes[i];
+    
     int64_t size_dim = sizes[dim];
-    int64_t total_sequences = 1;
-    for (int64_t i = 0; i < dim; ++i) {
-        total_sequences *= sizes[i];
-    }
-    total_sequences *= inner_stride;  // 实际序列数 = outer_size * inner_size
-
-    // 分配输出
+    
+    // 分配输出张量（与输入形状相同）
     auto output_fp32 = torch::empty_like(input_fp32);
-
-    // 获取当前 MLU 流
+    
+    // 获取当前 MLU 流（队列）
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-
-    // 启动核函数（使用 128 个核，可调整）
+    
+    // 启动核函数（使用 128 个核，可根据硬件调整）
     uint32_t core_num = 128;
     cnrtDim3_t dim_grid = {core_num, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
-
+    
     cumsum_kernel<<<dim_grid, ktype, queue>>>(
         input_fp32.data_ptr<float>(),
         output_fp32.data_ptr<float>(),
         static_cast<int>(size_dim),
         static_cast<int>(inner_stride),
-        static_cast<int>(outer_stride),
-        static_cast<int>(total_sequences)
+        static_cast<int>(outer_size)
     );
-
-    // 同步并返回
+    
+    // 将结果转换回原始数据类型
     if (original_dtype != torch::kFloat) {
         return output_fp32.to(original_dtype);
     }
