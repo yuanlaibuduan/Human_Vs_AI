@@ -5,11 +5,12 @@
 
 #define CIN_TILE 8
 #define COUT_TILE 8
-#define H_TILE 24
-#define W_TILE 24
+#define H_TILE 16
+#define W_TILE 32
+#define W_EXT 36   // W_TILE + K - 1 = 34, padded to 36 for BANG alignment
+#define H_EXT (H_TILE + 2)  // 18
 #define K 3
-#define H_EXT (H_TILE+K-1)
-#define W_EXT (W_TILE+K-1)
+#define ALIGNED_N 32
 
 __mlu_entry__ void convtransp2d_kernel(
     float* input,
@@ -26,10 +27,11 @@ __mlu_entry__ void convtransp2d_kernel(
     uint32_t sb = cid * bpc + (cid < brem ? cid : brem);
     uint32_t mb = bpc + (cid < brem ? 1 : 0);
 
-    // nk now has a COUT_TILE dimension – fixes the weight-overwrite bug
+    // NRAM: 8*18*36 + 8*16*32 + 8*8*9 + 32 = 9888 floats = 39.5KB
     __nram__ float ni[CIN_TILE][H_EXT][W_EXT];
     __nram__ float na[COUT_TILE][H_TILE][W_TILE];
     __nram__ float nk[CIN_TILE][COUT_TILE][K][K];
+    __nram__ float nram_temp[ALIGNED_N];
 
     for (uint32_t b = 0; b < mb; b++) {
         uint32_t bi = sb + b;
@@ -47,7 +49,7 @@ __mlu_entry__ void convtransp2d_kernel(
                     uint32_t wt = (wo + W_TILE <= WO) ? W_TILE : (WO - wo);
                     uint32_t we = wt + K - 1;
 
-                    // zero accumulator
+                    // Zero accumulator (only wt elements needed)
                     for (uint32_t co = 0; co < cot; co++)
                         for (uint32_t i = 0; i < ht; i++)
                             for (uint32_t j = 0; j < wt; j++)
@@ -56,11 +58,11 @@ __mlu_entry__ void convtransp2d_kernel(
                     for (uint32_t ci_g = 0; ci_g < CI; ci_g += CIN_TILE) {
                         uint32_t cit = (ci_g + CIN_TILE <= CI) ? CIN_TILE : (CI - ci_g);
 
-                        // load kernel (all co, all ci) + input (per ci)
+                        // Load kernel and input
                         for (uint32_t ci = 0; ci < cit; ci++) {
                             uint32_t gci = ci_g + ci;
 
-                            // load flipped kernel weights into nk[ci][co][kh][kw]
+                            // Load flipped kernel for all co
                             for (uint32_t co = 0; co < cot; co++) {
                                 uint32_t gco = co_g + co;
                                 for (uint32_t kh = 0; kh < K; kh++)
@@ -71,12 +73,12 @@ __mlu_entry__ void convtransp2d_kernel(
                                             + (K - 1 - kw)];
                             }
 
-                            // zero the input tile
+                            // Zero input tile (full W_EXT per row)
                             for (uint32_t i = 0; i < he; i++)
-                                for (uint32_t j = 0; j < we; j++)
+                                for (uint32_t j = 0; j < W_EXT; j++)
                                     ni[ci][i][j] = 0.0f;
 
-                            // load valid input region
+                            // Load valid input region
                             int prs = (int)ho;
                             int pre = (int)(ho + he - 1);
                             int vs = K - 1;
@@ -95,28 +97,27 @@ __mlu_entry__ void convtransp2d_kernel(
                                 if (wcs <= wce)
                                     __memcpy(
                                         &ni[ci][r - (int)ho][wcs - (int)wo],
-                                        bin + gci * HI * WI
-                                            + ir * WI
-                                            + (wcs - (K - 1)),
+                                        bin + gci * HI * WI + ir * WI + (wcs - (K - 1)),
                                         (wce - wcs + 1) * sizeof(float),
                                         GDRAM2NRAM);
                             }
                         }
 
-                        // convolution: na[co][hi][wi] += nk[ci][co][kh][kw] * ni[ci][hi+kh][wi+kw]
+                        // Convolution using BANG SIMD (processes W_TILE=32 elements at once)
                         for (uint32_t co = 0; co < cot; co++)
                             for (uint32_t ci = 0; ci < cit; ci++)
                                 for (uint32_t kh = 0; kh < K; kh++)
-                                    for (uint32_t kw = 0; kw < K; kw++) {
-                                        float wk = nk[ci][co][kh][kw];
-                                        for (uint32_t hi = 0; hi < ht; hi++)
-                                            for (uint32_t wi = 0; wi < wt; wi++)
-                                                na[co][hi][wi] +=
-                                                    wk * ni[ci][hi + kh][wi + kw];
-                                    }
+                                    for (uint32_t hi = 0; hi < ht; hi++)
+                                        for (uint32_t kw = 0; kw < K; kw++) {
+                                            float wk = nk[ci][co][kh][kw];
+                                            // nram_temp[0..31] = wk * ni[ci][hi+kh][kw..kw+31]
+                                            __bang_mul_scalar(nram_temp, &ni[ci][hi + kh][kw], wk, ALIGNED_N);
+                                            // na[co][hi][0..31] += nram_temp[0..31]
+                                            __bang_add(na[co][hi], na[co][hi], nram_temp, ALIGNED_N);
+                                        }
                     }
 
-                    // store output tile
+                    // Store output tile (only wt elements per row)
                     for (uint32_t co = 0; co < cot; co++) {
                         uint32_t gco = co_g + co;
                         for (uint32_t hi = 0; hi < ht; hi++)
