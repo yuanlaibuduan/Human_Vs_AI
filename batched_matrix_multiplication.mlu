@@ -3,16 +3,14 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
-// Tile sizes tuned for [512, 1024] x [1024, 2048]:
-//   Scalar float32 FMA inner loop for precision.
-//   NRAM: 64*64 + 64*256 + 64*256 = 37K floats = 148 KB.
 #define TILE_M 64
 #define TILE_N 256
 #define TILE_K 64
+#define ALIGNED_N 256
 
 // MLU kernel: batched matrix multiplication C = A @ B
-//   Scalar float32 FMA inner loop – avoids FP16 precision loss
-//   from BANG vector ALU on compute_30.
+//   BANG vector intrinsics for high performance
+//   Float16 precision is acceptable per requirements
 __mlu_entry__ void batched_matmul_kernel(
     float *A,
     float *B,
@@ -33,10 +31,11 @@ __mlu_entry__ void batched_matmul_kernel(
     uint32_t my_batches = batches_per_core +
                           (core_id < batch_rem ? 1 : 0);
 
-    // NRAM tile buffers (scalar float32 FMAs for precision)
+    // NRAM tile buffers
     __nram__ float nram_A[TILE_M][TILE_K];
     __nram__ float nram_B[TILE_K][TILE_N];
     __nram__ float nram_C[TILE_M][TILE_N];
+    __nram__ float nram_temp[TILE_N];
 
     for (uint32_t b = 0; b < my_batches; b++) {
         uint32_t batch = start_batch + b;
@@ -70,12 +69,14 @@ __mlu_entry__ void batched_matmul_kernel(
                                  batch_B + (k_off + kk) * N + n_off,
                                  n_tile * sizeof(float), GDRAM2NRAM);
 
-                    // C += A @ B  (scalar float32 FMA – avoids FP16 vector ALU precision loss)
+                    // C += A @ B using BANG vector intrinsics
                     for (uint32_t i = 0; i < m_tile; i++)
                         for (uint32_t kk = 0; kk < k_tile; kk++) {
                             float aik = nram_A[i][kk];
-                            for (uint32_t j = 0; j < n_tile; j++)
-                                nram_C[i][j] += aik * nram_B[kk][j];
+                            // temp[:] = aik * B[kk][:] (vector multiply, src != dst)
+                            __bang_mul_scalar(nram_temp, nram_B[kk], aik, ALIGNED_N);
+                            // C[i][:] += temp[:] (vector add)
+                            __bang_add(nram_C[i], nram_C[i], nram_temp, ALIGNED_N);
                         }
                 }
 

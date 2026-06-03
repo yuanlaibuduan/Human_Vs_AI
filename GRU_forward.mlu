@@ -1,31 +1,15 @@
 #include <bang.h>
 #include <cnrt.h>
 #include <torch/extension.h>
-#include <cmath>
+#include <math.h>
 
-#define TILE_H 64   // 每次处理的权重行数
-#define TILE_W 64   // 每次处理的输入/隐藏列数
-#define MAX_HIDDEN 1024   // 最大隐藏层维度（可根据需要调整）
-#define MAX_INPUT  1024   // 最大输入维度
+#define MAX_HIDDEN 1024  // 足够覆盖 hidden_size=512
 
-// 辅助函数：sigmoid
-__mlu_func__ void sigmoid_nram(float *dst, float *src, int n) {
-    __nram__ float tmp[MAX_HIDDEN];   // 固定大小，足够覆盖最大维度
-    __bang_neg(tmp, src, n);
-    __bang_active_exp(tmp, tmp, n);
-    __bang_add_scalar(tmp, tmp, 1.0f, n);
-    __bang_reciprocal(dst, tmp, n);
-}
-
-// 单层单时间步 GRU 核函数（支持任意大小，内部固定分块）
+// 单层单时间步 GRU 核函数（使用逐点积循环）
 __mlu_entry__ void gru_cell_kernel(
-    float *x_t,          // [batch, input_size]
-    float *h_prev,       // [batch, hidden_size]
-    float *h_next,       // [batch, hidden_size]
-    float *w_ih,         // [3*hidden_size, input_size]
-    float *w_hh,         // [3*hidden_size, hidden_size]
-    float *b_ih,         // [3*hidden_size]
-    float *b_hh,         // [3*hidden_size]
+    float *x_t, float *h_prev, float *h_next,
+    float *w_ih, float *w_hh,
+    float *b_ih, float *b_hh,
     int batch, int input_size, int hidden_size
 ) {
     uint32_t core_id = taskId;
@@ -41,100 +25,93 @@ __mlu_entry__ void gru_cell_kernel(
     float *h_prev_local = h_prev + start_b * hidden_size;
     float *h_next_local = h_next + start_b * hidden_size;
 
-    // 固定大小的 NRAM 缓冲区（按最大可能尺寸分配，但实际只用一部分）
-    __nram__ float nram_w_ih[TILE_H * MAX_INPUT];
-    __nram__ float nram_w_hh[TILE_H * MAX_HIDDEN];
-    __nram__ float nram_x[TILE_W];
-    __nram__ float nram_h[TILE_W];
-    __nram__ float nram_gate_ih[3 * MAX_HIDDEN];
-    __nram__ float nram_gate_hh[3 * MAX_HIDDEN];
-    __nram__ float nram_z[MAX_HIDDEN];
-    __nram__ float nram_r[MAX_HIDDEN];
-    __nram__ float nram_n[MAX_HIDDEN];
-    __nram__ float nram_tmp[MAX_HIDDEN];
-    __nram__ float nram_one[MAX_HIDDEN];
+    // NRAM 缓冲区 (足够存储 3*hidden_size 个浮点数)
+    __nram__ float nram_gate[3 * MAX_HIDDEN];
+    __nram__ float nram_tmp[3 * MAX_HIDDEN];
 
-    // 预置常量 1.0
-    __bang_write_zero(nram_one, MAX_HIDDEN);
-    __bang_add_scalar(nram_one, nram_one, 1.0f, MAX_HIDDEN);
-
-    // 逐个样本处理
     for (int s = 0; s < local_batch; ++s) {
         float *x_s = x_local + s * input_size;
         float *h_prev_s = h_prev_local + s * hidden_size;
         float *h_next_s = h_next_local + s * hidden_size;
 
-        // ----- 1. 计算 W_ih * x_t + b_ih -----
-        // 初始化为偏置
-        __memcpy(nram_gate_ih, b_ih, 3 * hidden_size * sizeof(float), GDRAM2NRAM);
-        // 分块矩阵乘
-        for (int row = 0; row < 3 * hidden_size; row += TILE_H) {
-            int rows_left = 3 * hidden_size - row;
-            int cur_rows = (rows_left < TILE_H) ? rows_left : TILE_H;
-            // 加载权重块 (cur_rows x input_size)
-            __memcpy(nram_w_ih, w_ih + row * input_size, cur_rows * input_size * sizeof(float), GDRAM2NRAM);
-            // 分列处理输入 x
-            for (int col = 0; col < input_size; col += TILE_W) {
-                int cols_left = input_size - col;
-                int cur_cols = (cols_left < TILE_W) ? cols_left : TILE_W;
-                __memcpy(nram_x, x_s + col, cur_cols * sizeof(float), GDRAM2NRAM);
-                // 矩阵乘: nram_w_ih[cur_rows x cur_cols] * nram_x[cur_cols x 1] -> 结果加到 nram_gate_ih + row
-                // 要求 cur_cols 对齐到 64，这里 cur_cols 可能不是64倍数，但 nram_x 列数不足时，需补零处理。
-                // 更严谨的做法：使用 __bang_matmul 的 stride 参数，但为简化，假设 input_size 是 TILE_W 的倍数。
-                __bang_matmul(nram_gate_ih + row, nram_w_ih, nram_x, cur_rows, 1, cur_cols, cur_rows, 1, cur_cols);
+        // 1. 计算 W_ih * x + b_ih
+        // 将偏置拷贝到 nram_gate
+        __memcpy(nram_gate, b_ih, 3 * hidden_size * sizeof(float), GDRAM2NRAM);
+        for (int i = 0; i < 3 * hidden_size; ++i) {
+            float sum = 0.0f;
+            float *w_row = w_ih + i * input_size;
+            for (int j = 0; j < input_size; ++j) {
+                sum += w_row[j] * x_s[j];
             }
+            nram_gate[i] += sum;
         }
 
-        // ----- 2. 计算 W_hh * h_prev + b_hh -----
-        __memcpy(nram_gate_hh, b_hh, 3 * hidden_size * sizeof(float), GDRAM2NRAM);
-        for (int row = 0; row < 3 * hidden_size; row += TILE_H) {
-            int rows_left = 3 * hidden_size - row;
-            int cur_rows = (rows_left < TILE_H) ? rows_left : TILE_H;
-            __memcpy(nram_w_hh, w_hh + row * hidden_size, cur_rows * hidden_size * sizeof(float), GDRAM2NRAM);
-            for (int col = 0; col < hidden_size; col += TILE_W) {
-                int cols_left = hidden_size - col;
-                int cur_cols = (cols_left < TILE_W) ? cols_left : TILE_W;
-                __memcpy(nram_h, h_prev_s + col, cur_cols * sizeof(float), GDRAM2NRAM);
-                __bang_matmul(nram_gate_hh + row, nram_w_hh, nram_h, cur_rows, 1, cur_cols, cur_rows, 1, cur_cols);
+        // 2. 计算 W_hh * h_prev + b_hh
+        __memcpy(nram_tmp, b_hh, 3 * hidden_size * sizeof(float), GDRAM2NRAM);
+        for (int i = 0; i < 3 * hidden_size; ++i) {
+            float sum = 0.0f;
+            float *w_row = w_hh + i * hidden_size;
+            for (int j = 0; j < hidden_size; ++j) {
+                sum += w_row[j] * h_prev_s[j];
             }
+            nram_tmp[i] += sum;
+        }
+        // 相加得到总门控
+        for (int i = 0; i < 3 * hidden_size; ++i) {
+            nram_gate[i] += nram_tmp[i];
         }
 
-        // ----- 3. 相加得总门控 -----
-        __bang_add(nram_tmp, nram_gate_ih, nram_gate_hh, 3 * hidden_size);
-        // 复制到 nram_gates（复用 nram_tmp）
-        // 分割指针
-        float *r_ptr = nram_tmp;
-        float *z_ptr = nram_tmp + hidden_size;
-        float *n_linear_ptr = nram_tmp + 2 * hidden_size;
+        // 分割门控
+        float *r_ptr = nram_gate;
+        float *z_ptr = nram_gate + hidden_size;
+        float *n_linear_ptr = nram_gate + 2 * hidden_size;
+        float *n_hh_ptr = nram_tmp + 2 * hidden_size;  // nram_tmp 中存储的是 W_hh*h + b_hh
 
-        // ----- 4. 激活 r 和 z -----
-        sigmoid_nram(nram_r, r_ptr, hidden_size);
-        sigmoid_nram(nram_z, z_ptr, hidden_size);
+        // 3. 计算 sigmoid(r) 和 sigmoid(z)
+        for (int i = 0; i < hidden_size; ++i) {
+            float x = r_ptr[i];
+            float sig = 1.0f / (1.0f + expf(-x));
+            nram_tmp[i] = sig;  // 存储 r_sig
+        }
+        for (int i = 0; i < hidden_size; ++i) {
+            float x = z_ptr[i];
+            float sig = 1.0f / (1.0f + expf(-x));
+            z_ptr[i] = sig;     // 覆盖 z_ptr
+        }
+        float *r_sig = nram_tmp;
 
-        // ----- 5. 计算 n = tanh( n_linear + r * (W_hn*h + b_hn) ) -----
-        // n_hh_ptr 是 gate_hh 的第三部分
-        float *n_hh_ptr = nram_gate_hh + 2 * hidden_size;
-        __bang_mul(nram_n, nram_r, n_hh_ptr, hidden_size);
-        __bang_add(nram_n, n_linear_ptr, nram_n, hidden_size);
-        __bang_active_tanh(nram_n, nram_n, hidden_size);
+        // 4. 计算 n = tanh( n_linear + r * n_hh )
+        for (int i = 0; i < hidden_size; ++i) {
+            float val = n_linear_ptr[i] + r_sig[i] * n_hh_ptr[i];
+            float tanh_val = (expf(2*val) - 1.0f) / (expf(2*val) + 1.0f);
+            nram_tmp[hidden_size + i] = tanh_val;  // 存储 n
+        }
+        float *n = nram_tmp + hidden_size;
 
-        // ----- 6. h_next = (1 - z) * n + z * h_prev -----
-        __bang_sub(nram_tmp, nram_one, nram_z, hidden_size);   // 1 - z
-        __bang_mul(nram_tmp, nram_tmp, nram_n, hidden_size);    // (1-z)*n
-        __bang_mul(nram_z, nram_z, h_prev_s, hidden_size);      // z * h_prev
-        __bang_add(nram_tmp, nram_tmp, nram_z, hidden_size);    // 结果
-        __memcpy(h_next_s, nram_tmp, hidden_size * sizeof(float), NRAM2GDRAM);
+        // 5. h_next = (1 - z) * n + z * h_prev
+        for (int i = 0; i < hidden_size; ++i) {
+            float z = z_ptr[i];
+            float one_minus_z = 1.0f - z;
+            h_next_s[i] = one_minus_z * n[i] + z * h_prev_s[i];
+        }
     }
 }
 
-// 宿主函数（与之前相同，仅保留类型转换和调用）
+// 宿主函数（与题目要求签名完全一致）
 torch::Tensor bang_func(
-    torch::Tensor x, torch::Tensor weight_ih_l0, torch::Tensor weight_hh_l0,
-    torch::Tensor bias_ih_l0, torch::Tensor bias_hh_l0,
-    torch::Tensor weight_ih_l1, torch::Tensor weight_hh_l1,
-    torch::Tensor bias_ih_l1, torch::Tensor bias_hh_l1,
-    int input_size, int hidden_size, int num_layers) {
-
+    torch::Tensor x,
+    torch::Tensor weight_ih_l0,
+    torch::Tensor weight_hh_l0,
+    torch::Tensor bias_ih_l0,
+    torch::Tensor bias_hh_l0,
+    torch::Tensor weight_ih_l1,
+    torch::Tensor weight_hh_l1,
+    torch::Tensor bias_ih_l1,
+    torch::Tensor bias_hh_l1,
+    int input_size,
+    int hidden_size,
+    int num_layers
+) {
     auto original_dtype = x.scalar_type();
     auto to_fp32 = [](torch::Tensor& t) -> torch::Tensor {
         if (t.scalar_type() == torch::kFloat) return t.contiguous();
@@ -181,10 +158,12 @@ torch::Tensor bang_func(
     for (int t = 0; t < seq_len; ++t) {
         float *x_t_ptr = x_ptr + t * batch * input_size;
         gru_cell_kernel<<<dim, ktype, queue>>>(
-            x_t_ptr, h0_ptr, new_h0_ptr, w_ih0_ptr, w_hh0_ptr, b_ih0_ptr, b_hh0_ptr,
+            x_t_ptr, h0_ptr, new_h0_ptr,
+            w_ih0_ptr, w_hh0_ptr, b_ih0_ptr, b_hh0_ptr,
             batch, input_size, hidden_size);
         gru_cell_kernel<<<dim, ktype, queue>>>(
-            new_h0_ptr, h1_ptr, new_h1_ptr, w_ih1_ptr, w_hh1_ptr, b_ih1_ptr, b_hh1_ptr,
+            new_h0_ptr, h1_ptr, new_h1_ptr,
+            w_ih1_ptr, w_hh1_ptr, b_ih1_ptr, b_hh1_ptr,
             batch, hidden_size, hidden_size);
 
         float *out_t_ptr = out_ptr + t * batch * hidden_size;
