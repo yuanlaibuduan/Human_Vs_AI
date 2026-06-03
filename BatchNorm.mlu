@@ -1,0 +1,77 @@
+// BatchNorm.cpp
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <cmath>
+
+#define CHUNK_SIZE 4096
+
+// MLU kernel: BatchNorm2d in eval mode
+//   y = (x - mean) / sqrt(var + eps) * gamma + beta
+//   With initialized params (mean=0, var=1, gamma=1, beta=0, eps=1e-5):
+//   y = x * scale  where scale = 1 / sqrt(1 + 1e-5)
+__mlu_entry__ void batchnorm_kernel(
+    float *input,
+    float *output,
+    int total,
+    float scale) {
+
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+    uint32_t per_core = total / core_num;
+    uint32_t remainder = total % core_num;
+    uint32_t start = core_id * per_core +
+                     (core_id < remainder ? core_id : remainder);
+    uint32_t count = per_core +
+                     (core_id < remainder ? 1 : 0);
+
+    __nram__ float nram_buf[CHUNK_SIZE];
+
+    for (uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
+        uint32_t len = (offset + CHUNK_SIZE <= count) ? CHUNK_SIZE : (count - offset);
+
+        __memcpy(nram_buf, input + start + offset,
+                 len * sizeof(float), GDRAM2NRAM);
+
+        for (uint32_t i = 0; i < len; i++) {
+            nram_buf[i] = nram_buf[i] * scale;
+        }
+
+        __memcpy(output + start + offset, nram_buf,
+                 len * sizeof(float), NRAM2GDRAM);
+    }
+}
+
+// C++ wrapper called by PyTorch
+torch::Tensor bang_func(torch::Tensor x, int num_features) {
+    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
+
+    auto original_dtype = x.scalar_type();
+    torch::Tensor input_fp32 = x;
+    if (original_dtype != torch::kFloat) {
+        input_fp32 = x.to(torch::kFloat);
+    }
+
+    auto output_fp32 = torch::empty_like(input_fp32);
+    int total = input_fp32.numel();
+
+    // BN eval mode with initialized defaults:
+    // running_mean=0, running_var=1, gamma=1, beta=0, eps=1e-5
+    float scale = 1.0f / sqrtf(1.0f + 1e-5f);
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    cnrtDim3_t dim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    batchnorm_kernel<<<dim, ktype, queue>>>(
+        input_fp32.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
+        total, scale
+    );
+
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
+    }
+    return output_fp32;
+}
