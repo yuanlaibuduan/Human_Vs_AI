@@ -1,73 +1,133 @@
+// 051_cumsum.mlu
+// BangC implementation of cumulative sum (prefix sum) along a specified dimension.
+// The operator computes for each slice along `dim` the inclusive prefix sum.
+
 #include <bang.h>
-#include <torch/extension.h>
 #include <cnrt.h>
+#include <torch/extension.h>
 
-#define CHUNK_SIZE 1024
+#define CHUNK_SIZE 4096  // Size of tile processed per iteration in NRAM
 
-__mlu_entry__ void cumsum_kernel(
-    const float* src,
-    float* dst,
-    int64_t outer,
-    int64_t dim_len,
-    int64_t inner
-) {
+// Kernel: compute inclusive prefix sum for each 1‑D slice.
+// The input and output tensors are assumed to be contiguous in memory with the
+// dimension of interest being the fastest changing (last dimension).
+// Parameters:
+//   input       - pointer to input tensor (float32)
+//   output      - pointer to output tensor (float32)
+//   slice_count - number of independent 1‑D slices ( = total_elements / slice_len )
+//   slice_len   - length of each slice (size of the dimension along which we sum)
+__mlu_entry__ void cumsum_kernel(float* input, float* output,
+                                 int slice_count, int slice_len) {
     uint32_t core_id = taskId;
     uint32_t core_num = taskDim;
 
-    int64_t task_per_core = outer / core_num;
-    int64_t rem = outer % core_num;
-    int64_t beg = core_id * task_per_core + (core_id < rem ? core_id : rem);
-    int64_t end = beg + task_per_core + (core_id < rem ? 1 : 0);
+    // Distribute slices among cores
+    int slices_per_core = (slice_count + core_num - 1) / core_num;
+    int start_slice = core_id * slices_per_core;
+    int end_slice = start_slice + slices_per_core;
+    if (end_slice > slice_count) end_slice = slice_count;
 
-    __nram__ float n_in[CHUNK_SIZE];
-    __nram__ float n_acc[CHUNK_SIZE];
-    __nram__ float n_out[CHUNK_SIZE];
+    // NRAM buffers for one tile
+    __nram__ float nram_in[CHUNK_SIZE];
+    __nram__ float nram_out[CHUNK_SIZE];
 
-    for (int64_t o = beg; o < end; ++o) {
-        for (int64_t ib = 0; ib < inner; ib += CHUNK_SIZE) {
-            int64_t cur_inner = inner - ib;
-            cur_inner = cur_inner > CHUNK_SIZE ? CHUNK_SIZE : cur_inner;
-            int64_t align_len = (cur_inner + 63) & ~63;
+    for (int s = start_slice; s < end_slice; ++s) {
+        float* in_slice = input + s * slice_len;
+        float* out_slice = output + s * slice_len;
+        float acc = 0.0f;
 
-            for (int i = 0; i < align_len; ++i)
-                n_acc[i] = 0.0f;
+        // Process the slice in chunks
+        for (int offset = 0; offset < slice_len; offset += CHUNK_SIZE) {
+            int len = slice_len - offset;
+            if (len > CHUNK_SIZE) len = CHUNK_SIZE;
 
-            for (int64_t d = 0; d < dim_len; ++d) {
-                int64_t g_off = o * dim_len * inner + d * inner + ib;
+            // Load chunk from GDRAM to NRAM
+            __memcpy(nram_in, in_slice + offset, len * sizeof(float), GDRAM2NRAM);
 
-                __memcpy(n_in, src + g_off, cur_inner * sizeof(float), GDRAM2NRAM);
-                __bang_add(n_out, n_acc, n_in, align_len);
-                __bang_move(n_acc, n_out, align_len);
-                __memcpy(dst + g_off, n_out, cur_inner * sizeof(float), NRAM2GDRAM);
+            // Sequential prefix sum inside the chunk
+            for (int i = 0; i < len; ++i) {
+                acc += nram_in[i];
+                nram_out[i] = acc;
             }
+
+            // Write back from NRAM to GDRAM
+            __memcpy(out_slice + offset, nram_out, len * sizeof(float), NRAM2GDRAM);
         }
     }
 }
 
+// External wrapper: performs necessary transformations, launches the kernel,
+// and restores the original layout and data type.
+// Parameters:
+//   x   - input tensor
+//   dim - dimension along which to compute cumulative sum
+// Returns:
+//   output tensor of same shape and dtype as x
 torch::Tensor bang_func(torch::Tensor x, int dim) {
-    TORCH_CHECK(x.is_contiguous(), "input must be contiguous");
-    auto sizes = x.sizes();
-    int ndim = sizes.size();
+    // Ensure input is contiguous
+    x = x.contiguous();
+
+    // Original dtype (e.g., float32, float16, etc.)
+    auto original_dtype = x.scalar_type();
+
+    // Handle negative dim
+    int64_t ndim = x.dim();
     if (dim < 0) dim += ndim;
+    TORCH_CHECK(dim >= 0 && dim < ndim, "Invalid dimension");
 
-    torch::Tensor x_fp32 = x.to(torch::kFloat);
-    torch::Tensor out = torch::empty_like(x_fp32);
+    // Transform the tensor so that the target dimension becomes the last one.
+    // This makes each slice contiguous in memory, simplifying the kernel.
+    bool need_permute = (dim != ndim - 1);
+    std::vector<int64_t> perm;
+    if (need_permute) {
+        perm.reserve(ndim);
+        for (int64_t i = 0; i < ndim; ++i) {
+            if (i != dim) perm.push_back(i);
+        }
+        perm.push_back(dim);
+        x = x.permute(perm).contiguous();
+    }
 
-    int64_t outer = 1;
-    for (int i = 0; i < dim; i++) outer *= sizes[i];
-    int64_t dim_l = sizes[dim];
-    int64_t inner = 1;
-    for (int i = dim + 1; i < ndim; i++) inner *= sizes[i];
+    // Convert to float32 for computation
+    torch::Tensor x_fp32 = x;
+    if (original_dtype != torch::kFloat) {
+        x_fp32 = x.to(torch::kFloat);
+    }
 
-    cnrtQueue_t q = torch_mlu::getCurMLUStream();
-    cnrtDim3_t grid = {16, 1, 1};
+    // Dimensions after permutation: last dimension is the original `dim`
+    int64_t slice_len = x_fp32.size(-1);
+    int64_t slice_count = x_fp32.numel() / slice_len;
+
+    // Allocate output tensor (float32)
+    auto output_fp32 = torch::empty_like(x_fp32);
+
+    // Launch configuration
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim_grid = {4, 1, 1};          // Number of cores (task dimension)
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
-    cumsum_kernel<<<grid, ktype, q>>>(
+    cumsum_kernel<<<dim_grid, ktype, queue>>>(
         x_fp32.data_ptr<float>(),
-        out.data_ptr<float>(),
-        outer, dim_l, inner
+        output_fp32.data_ptr<float>(),
+        static_cast<int>(slice_count),
+        static_cast<int>(slice_len)
     );
 
-    return out.to(x.scalar_type());
+    // Restore original dimension order if permuted
+    torch::Tensor result = output_fp32;
+    if (need_permute) {
+        // Inverse permutation: move the last dimension back to its original position
+        std::vector<int64_t> inv_perm(ndim);
+        for (int64_t i = 0; i < ndim; ++i) {
+            inv_perm[perm[i]] = i;
+        }
+        result = result.permute(inv_perm).contiguous();
+    }
+
+    // Cast back to original data type
+    if (original_dtype != torch::kFloat) {
+        result = result.to(original_dtype);
+    }
+
+    return result;
 }
