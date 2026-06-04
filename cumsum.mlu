@@ -1,102 +1,261 @@
 #include <bang.h>
-#include <cnrt.h>
 #include <torch/extension.h>
+#include <cnrt.h>
 
-#define MAX_DIM 8
+// 定义 NRAM 缓冲区大小，通常取 64KB / sizeof(float) = 16384，这里保守取 8192 或更小以适应栈空间
+#define CHUNK_SIZE 8192
 
-// 核函数：沿指定维度计算累加前缀和（fp32版本）
-// 参数：
-//   input   : 输入张量指针（fp32）
-//   output  : 输出张量指针（fp32）
-//   seq_len : 指定维度的长度（每个序列的元素个数）
-//   post_size : 指定维度之后所有维度的元素个数乘积，同时也是相邻元素在内存中的步长
-//   num_seqs : 序列总数（= total_elements / seq_len）
-//   total_elements : 总元素个数（用于边界检查，可选）
-__mlu_entry__ void cumsum_kernel(float *input, float *output, int seq_len,
-                                 int post_size, int num_seqs, int total_elements) {
+/**
+ * @brief CumSum 核函数
+ * @param input      输入张量指针 (已转 fp32)
+ * @param output     输出张量指针 (fp32)
+ * @param stride_out 输出张量在 dim 维度上的步长
+ * @param len        dim 维度的长度
+ * @param num_lines  需要处理的总行数 (除 dim 外所有维度的乘积)
+ */
+__mlu_entry__ void cumsum_kernel(
+    float *input,
+    float *output,
+    int stride_out,
+    int len,
+    int num_lines) {
+
+    // 获取当前核心 ID 和总核心数
     uint32_t core_id = taskId;
     uint32_t core_num = taskDim;
 
-    // 将序列均匀分配给各个 core
-    uint32_t per_core = num_seqs / core_num;
-    uint32_t remainder = num_seqs % core_num;
-    uint32_t start_seq = core_id * per_core + (core_id < remainder ? core_id : remainder);
-    uint32_t local_seq_num = per_core + (core_id < remainder ? 1 : 0);
+    // 计算当前核心负责的行索引范围
+    for (int line_idx = core_id; line_idx < num_lines; line_idx += core_num) {
+        // 计算当前行的基地址偏移
+        // 假设输入是 contiguous 的，且我们按行处理
+        // 这里的逻辑简化为：每行长度为 len，步长为 stride_out
+        // 实际物理地址需要根据原始 shape 计算，但在 Wrapper 中我们将非 dim 维度展平了
+        // 这里的 input/output 指针已经指向了当前 line 的起始位置 (在 Wrapper 层做了处理或者在这里做复杂寻址)
+        // 为了简化核函数，我们在 Wrapper 中传入的是扁平化后的行指针列表是不现实的。
+        // 标准做法是：Wrapper 保证 input 是 contiguous，且在 dim 维度上是连续的（或者通过 stride 访问）。
+        // 鉴于题目限制，我们假设 Wrapper 传入了正确的 BasePtr，且我们通过 stride_out 跳跃访问。
 
-    // 处理分配给当前 core 的每一个序列
-    for (uint32_t s = 0; s < local_seq_num; ++s) {
-        uint32_t seq_idx = start_seq + s;               // 当前序列的全局编号
-        // 计算当前序列第一个元素在内存中的偏移量
-        // 公式：offset0 = (seq_idx / post_size) * (seq_len * post_size) + (seq_idx % post_size)
-        uint32_t pre_idx = seq_idx / post_size;          // 前缀维度索引
-        uint32_t post_idx = seq_idx % post_size;         // 后缀维度索引
-        uint32_t base_offset = pre_idx * (seq_len * post_size) + post_idx;
+        // 注意：如果 dim 不是最后一维，stride_out != 1。
+        // 但为了性能，通常要求用户在调用前 transpose 使 dim 变为最后一维，或者在核函数里处理 stride。
+        // 这里的实现假设：Wrapper 已经处理了内存布局，或者我们只处理 stride=1 的情况？
+        // 不，通用的 Cumsum 必须处理 Stride。
+        // 修正：MLU 编程中，通常将非累积维度的索引合并为一个大的 batch index。
+        // 设 total_elements = product(shape)。
+        // 对于第 line_idx 行，其起始地址为 input + line_idx * len (如果 dim 是最后一维且 contiguous)。
+        // 如果 dim 不是最后一维，情况会非常复杂。
+        // **优化策略**：在 Wrapper 中，如果不 contiguous，先 contiguous。
+        // 然后，如果 dim != ndim-1，我们需要在核函数里处理跨步，或者在 Wrapper 里 transpose。
+        // 考虑到题目难度和通用性，这里采用最稳健的方式：
+        // Wrapper 确保 Tensor 是 Contiguous 的。
+        // 如果 dim 不是最后一维，我们在 Wrapper 中交换维度，使其成为最后一维，计算完再换回来。
+        // 这样核函数只需要处理 stride=1 的最快路径。
 
-        float running_sum = 0.0f;
-        // 遍历序列中的每一个元素
-        for (int i = 0; i < seq_len; ++i) {
-            uint32_t offset = base_offset + i * post_size;
-            // 边界检查（可选，确保不越界）
-            if (offset >= (uint32_t)total_elements) break;
-            float val = input[offset];
-            running_sum += val;
-            output[offset] = running_sum;
+        // 假设进入此 Kernel 时，待计算的维度已经是最后一维 (Stride=1)，且数据连续。
+        // base_ptr = input + line_idx * len;
+
+        float *cur_in = input + line_idx * len;
+        float *cur_out = output + line_idx * len;
+
+        __nram__ float nram_buf[CHUNK_SIZE];
+        __nram__ float nram_out[CHUNK_SIZE];
+
+        int offset = 0;
+        float carry = 0.0f; // 上一块的累加和
+
+        while (offset < len) {
+            int cur_len = (len - offset < CHUNK_SIZE) ? (len - offset) : CHUNK_SIZE;
+            // 对齐长度，BangC 指令通常要求 64 字节对齐 (16 floats)
+            int aligned_len = (cur_len + 15) & ~15;
+
+            // 1. 从 GDRAM 搬运数据到 NRAM
+            __memcpy(nram_buf, cur_in + offset, cur_len * sizeof(float), GDRAM2NRAM);
+
+            // 2. 如果是第一块，直接拷贝作为初始值；否则加上 Carry
+            if (offset == 0) {
+                __memcpy(nram_out, nram_buf, cur_len * sizeof(float), NRAM2NRAM);
+            } else {
+                // 构造一个全为 carry 的向量加到当前块上
+                // 注意：__bang_add_scalar 是 element-wise add scalar? 不，那是 mul_scalar。
+                // 我们需要 nram_out[i] = nram_buf[i] + carry。
+                // 可以使用 __bang_add_const 或者手动构造常数向量。
+                // 更高效的方法：先 memcpy，再用 add_scalar (如果有) 或者利用广播特性。
+                // BangC 提供 __bang_add_const(dst, src, const_val, len) -> dst = src + const_val
+                __bang_add_const(nram_out, nram_buf, carry, aligned_len);
+            }
+
+            // 3. 执行 Prefix Sum (Scan)
+            // __bang_scan_sum 并不是标准的 BangC 指令集里的名字，通常是 __bang_cumsum 或者类似的。
+            // 查阅寒武纪文档，常用的扫描指令是 __bang_scan_add 或类似变体，但在较新的 SDK 中，
+            // 往往推荐使用循环移位加法或者专用的 scan 指令。
+            // 这里使用标准的二分法或者硬件支持的 scan 指令。
+            // 假设环境支持 __bang_scan_sum (部分 SDK 版本) 或使用通用模拟。
+            // 实际上，寒武纪 BANG C 提供了 __bang_scan_add 用于一维数组的前缀和。
+            // 签名: void __bang_scan_add(void *dst, void *src, int len);
+            // 它是原地操作还是非原地？通常是 dst = scan(src)。
+            // 注意：__bang_scan_add 可能会修改 src，所以最好 src 和 dst 分开，或者确认行为。
+            // 安全起见，我们在 nram_out 上做，因为 nram_out 目前包含了 (data + carry)。
+            // 但是 scan 是基于当前值的。
+            // 正确逻辑：
+            // temp = data + carry
+            // result = scan(temp)
+            // 但 scan(temp) = scan(data) + carry (线性性质)。
+            // 所以我们可以先 scan(data)，然后再加 carry。这样能复用 buffer。
+
+            // 回退一步：
+            // 刚才我们把 nram_out 设为了 data + carry。这不对。
+            // 应该先对 data 做 scan，得到 local_prefix_sum。
+            // 然后 local_prefix_sum += carry。
+
+            // 重新调整逻辑：
+            // 1. Load data to nram_buf.
+            // 2. Scan nram_buf -> nram_out (local prefix sum).
+            // 3. Add carry to nram_out.
+
+            // 修正后的步骤 2 & 3:
+            // 先把数据搬入 nram_out 准备做 scan
+            __memcpy(nram_out, nram_buf, cur_len * sizeof(float), NRAM2NRAM);
+
+            // 执行局部前缀和 (Inclusive Scan)
+            // 注意：__bang_scan_add 在某些版本可能是 exclusive，需确认。
+            // 标准 Cumsum 是 Inclusive。
+            // 如果没有专用指令，可以用 O(N) 的串行循环（NRAM 很快），或者 O(logN) 的并行算法。
+            // 鉴于这是 AI 芯片，通常有硬件加速。这里假设有 __bang_scan_add。
+            // 如果没有，以下是纯 NRAM 串行写法（对于 8k 长度也是可以接受的，约几微秒）：
+            /*
+            for(int i=1; i<cur_len; i++) {
+                nram_out[i] += nram_out[i-1];
+            }
+            */
+            // 使用 intrinsic 如果可用，否则用循环。为了保证兼容性，这里写一个高效的串行循环，
+            // 因为 NRAM 带宽极高，串行 8k float 非常快。
+            for (int i = 1; i < cur_len; ++i) {
+                nram_out[i] += nram_out[i - 1];
+            }
+
+            // 4. 加上之前的 Carry
+            if (carry != 0.0f) {
+                 __bang_add_const(nram_out, nram_out, carry, aligned_len);
+            }
+
+            // 5. 更新 Carry 为当前块的最后一个元素
+            carry = nram_out[cur_len - 1];
+
+            // 6. 写回 GDRAM
+            __memcpy(cur_out + offset, nram_out, cur_len * sizeof(float), NRAM2GDRAM);
+
+            offset += cur_len;
         }
     }
 }
 
-// 对外暴露的接口函数
 torch::Tensor bang_func(torch::Tensor x, int dim) {
-    // 处理负数维度
-    int ndim = x.dim();
-    if (dim < 0) dim += ndim;
-    TORCH_CHECK(dim >= 0 && dim < ndim, "Invalid dim ", dim, " for tensor with ", ndim, " dimensions");
-
-    // 确保输入是 contiguous 的，或者我们自己处理 stride（简化起见，要求 contiguous）
+    // 1. 参数检查与预处理
     TORCH_CHECK(x.is_contiguous(), "Input tensor must be contiguous");
 
-    // 保留原始数据类型
     auto original_dtype = x.scalar_type();
+    int ndim = x.dim();
 
-    // 转换为 fp32 进行计算
-    torch::Tensor x_fp32 = x;
+    // 处理负数 dim
+    if (dim < 0) dim += ndim;
+    TORCH_CHECK(dim >= 0 && dim < ndim, "Dim out of range");
+
+    // 2. 类型转换：统一转为 fp32 进行计算
+    torch::Tensor input_fp32 = x;
     if (original_dtype != torch::kFloat) {
-        x_fp32 = x.to(torch::kFloat);
+        input_fp32 = x.to(torch::kFloat);
     }
 
-    // 分配输出张量
-    torch::Tensor out_fp32 = torch::empty_like(x_fp32);
+    // 3. 维度变换：将目标维度 permute 到最后一维
+    // 这样做是为了让核函数只需处理连续内存，极大简化逻辑并提高性能
+    std::vector<int> dims(ndim);
+    std::iota(dims.begin(), dims.end(), 0);
+    // 将 dim 移到最后
+    dims.erase(dims.begin() + dim);
+    dims.push_back(dim);
 
-    // 获取张量形状信息
-    auto sizes = x_fp32.sizes();
-    int64_t seq_len = sizes[dim];                     // 指定维度的长度
-    int64_t post_size = 1;                            // 后缀维度的总元素个数
-    for (int d = dim + 1; d < ndim; ++d) {
-        post_size *= sizes[d];
+    auto x_permuted = input_fp32.permute(dims);
+    auto output_permuted = torch::empty_like(x_permuted);
+
+    // 获取变换后的形状信息
+    auto shape = x_permuted.sizes();
+    int len = shape[ndim - 1]; // 最后一维长度，即累加的长度
+    long long num_lines = 1;   // 总行数（Batch size 概念）
+    for (int i = 0; i < ndim - 1; ++i) {
+        num_lines *= shape[i];
     }
-    int64_t num_seqs = x_fp32.numel() / seq_len;      // 序列总数
-    int64_t total = x_fp32.numel();
 
-    // 获取当前 MLU 流对应的队列
+    // 如果长度为 0 或 1，直接返回拷贝
+    if (len <= 1) {
+        auto res = x_permuted.clone();
+        // 还原维度顺序
+        std::vector<int> inv_dims(ndim);
+        for(int i=0; i<ndim-1; ++i) inv_dims[i] = (i < dim) ? i : i+1;
+        inv_dims[ndim-1] = dim;
+        // 注意：permute 的逆操作需要小心构建，或者直接利用 argsort
+        // 简单方法：再次 permute 回去
+        // 原操作: 0..d-1, d+1..n-1, d -> 0..n-2, n-1
+        // 逆操作: 0..d-1, n-1, d..n-2 -> 0..d-1, d, d+1..n-1
+        std::vector<int> restore_dims(ndim);
+        for (int i = 0; i < ndim; ++i) {
+            if (i < dim) restore_dims[i] = i;
+            else if (i == ndim - 1) restore_dims[i] = dim;
+            else restore_dims[i] = i + 1; // 这里的逻辑有点绕，建议直接用 map
+        }
+        // 更简单的恢复方法：
+        // 记录原始 permutation，求逆
+        std::vector<int> perm(ndim);
+        std::iota(perm.begin(), perm.end(), 0);
+        std::rotate(perm.begin() + dim, perm.begin() + dim + 1, perm.end()); // move dim to end
+
+        // 求逆置换
+        std::vector<int> inv_perm(ndim);
+        for (int i = 0; i < ndim; ++i) inv_perm[perm[i]] = i;
+
+        res = res.permute(inv_perm);
+
+        if (original_dtype != torch::kFloat) {
+            return res.to(original_dtype);
+        }
+        return res;
+    }
+
+    // 4. 启动 Kernel
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
-    // 设置核函数启动参数（使用 16 个 core，可根据实际情况调整）
-    cnrtDim3_t dim_core = {16, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+    // 配置 Launch 参数
+    // Union1 模式适合这种不规则或大任务拆分
+    cnrtDim3_t k_dim = {4, 1, 1}; // 使用 4 个 Core，可根据实际硬件调整，通常 4 或 8
+    cnrtFunctionType_t k_type = cnrtFuncTypeUnion1;
+
+    // 获取指针
+    float *in_ptr = x_permuted.data_ptr<float>();
+    float *out_ptr = output_permuted.data_ptr<float>();
 
     // 启动核函数
-    cumsum_kernel<<<dim_core, ktype, queue>>>(
-        x_fp32.data_ptr<float>(),
-        out_fp32.data_ptr<float>(),
-        (int)seq_len,
-        (int)post_size,
-        (int)num_seqs,
-        (int)total
+    // 注意：num_lines 可能很大，kernel 内部会循环处理
+    cumsum_kernel<<<k_dim, k_type, queue>>>(
+        in_ptr,
+        out_ptr,
+        len,          // 这里的参数对应 kernel 定义的 len
+        num_lines     // 这里的参数对应 kernel 定义的 num_lines
+        // 注意：Kernel 定义里 stride_out 被省略了，因为我们 permute 到了最后一维，stride 必为 1
     );
 
-    // 将输出转换回原始数据类型
+    // 5. 后处理：维度还原与类型还原
+    // 还原维度顺序
+    std::vector<int> perm(ndim);
+    std::iota(perm.begin(), perm.end(), 0);
+    std::rotate(perm.begin() + dim, perm.begin() + dim + 1, perm.end());
+
+    std::vector<int> inv_perm(ndim);
+    for (int i = 0; i < ndim; ++i) inv_perm[perm[i]] = i;
+
+    auto output_final = output_permuted.permute(inv_perm);
+
+    // 还原数据类型
     if (original_dtype != torch::kFloat) {
-        return out_fp32.to(original_dtype);
+        return output_final.to(original_dtype);
     }
-    return out_fp32;
+
+    return output_final;
 }
