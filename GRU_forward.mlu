@@ -1,193 +1,169 @@
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
-#include <string>
 
-// 常量定义
 #define CHUNK_SIZE 1024
-#define GRU_GATE_NUM 3    // 更新门z、重置门r、候选隐态n
-#define ALIGN_BOUND 64
+#define ALIGN64 64
 
-/*
-GRU标准计算公式：
-z_t = σ(W_iz·x_t + b_iz + W_hz·h_{t-1}+b_hz)
-r_t = σ(W_ir·x_t + b_ir + W_hr·h_{t-1}+b_hr)
-n_t = tanh(W_in·x_t + b_in + r_t⊙(W_hn·h_{t-1}+b_hn))
-h_t = (1-z_t)⊙n_t + z_t⊙h_{t-1}
-*/
-
-// GRU单层单Batch核函数 (纯BangC实现，无任何torch/at调用)
 __mlu_entry__ void gru_layer_kernel(
-    float* g_in_seq,
-    float* g_out_hseq,
-    float* g_w_ih,
-    float* g_w_hh,
-    float* g_b_ih,
-    float* g_b_hh,
-    int batch,
-    int seq_len,
-    int in_size,
-    int hid_size
-) {
-    uint32_t core_id = taskId;
-    uint32_t core_cnt = taskDim;
+    float *g_in_seq,
+    float *g_out_seq,
+    float *g_w_ih,
+    float *g_w_hh,
+    float *g_b_ih,
+    float *g_b_hh,
+    int B,    // batch
+    int T,    // seq_len
+    int I,    // input_size
+    int H     // hidden_size
+)
+{
+    uint32_t core = taskId;
+    uint32_t ncore = taskDim;
 
-    // 按Batch维度拆分多核任务
-    uint32_t per_core_batch = batch / core_cnt;
-    uint32_t batch_remain = batch % core_cnt;
-    uint32_t start_b = core_id * per_core_batch + (core_id < batch_remain ? core_id : batch_remain);
-    uint32_t core_b_cnt = per_core_batch + (core_id < batch_remain ? 1 : 0);
+    int B_per_core = B / ncore;
+    int rem = B % ncore;
+    int st = core * B_per_core + (core < rem ? core : rem);
+    int cnt = B_per_core + (core < rem ? 1 : 0);
 
-    // NRAM 高速缓存
-    __nram__ float n_x[CHUNK_SIZE];
-    __nram__ float n_h_prev[CHUNK_SIZE];
-    __nram__ float n_ih_out[3 * CHUNK_SIZE];
-    __nram__ float n_hh_out[3 * CHUNK_SIZE];
-    __nram__ float n_z[CHUNK_SIZE];
-    __nram__ float n_r[CHUNK_SIZE];
-    __nram__ float n_n[CHUNK_SIZE];
-    __nram__ float n_h_cur[CHUNK_SIZE];
+    __nram__ float nx[CHUNK_SIZE];
+    __nram__ float h_prev[CHUNK_SIZE];
+    __nram__ float z[CHUNK_SIZE], r[CHUNK_SIZE], n[CHUNK_SIZE];
+    __nram__ float tmp0[CHUNK_SIZE], tmp1[CHUNK_SIZE];
+    __nram__ float tmp2[CHUNK_SIZE], tmp3[CHUNK_SIZE];
 
-    int gate3 = 3 * hid_size;
+    int G3 = 3 * H;
 
-    // 遍历当前核心负责的Batch样本
-    for (int b_idx = 0; b_idx < core_b_cnt; b_idx++) {
-        int cur_b = start_b + b_idx;
-        __bang_set_constant(n_h_prev, 0.0f, hid_size);
+    for (int b = 0; b < cnt; b++) {
+        int curB = st + b;
 
-        // 逐时间步计算
-        for (int t = 0; t < seq_len; t++) {
-            // 读取当前时刻输入 x_t
-            int x_offset = cur_b * seq_len * in_size + t * in_size;
-            __memcpy(n_x, g_in_seq + x_offset, in_size * sizeof(float), GDRAM2NRAM);
+        // h0 = 0 (手动循环赋值，无__bang_set_constant)
+        for (int i = 0; i < H; i++) h_prev[i] = 0.0f;
 
-            // W_ih @ x + bias_ih
-            __bang_gemm(n_ih_out, g_w_ih, n_x, gate3, in_size, 1, false, true);
-            __bang_add_bias(n_ih_out, n_ih_out, g_b_ih, gate3);
+        for (int t = 0; t < T; t++) {
+            // 加载 x_t
+            int x_off = curB * T * I + t * I;
+            __memcpy(nx, g_in_seq + x_off, I * 4, GDRAM2NRAM);
 
-            // W_hh @ h_prev + bias_hh
-            __bang_gemm(n_hh_out, g_w_hh, n_h_prev, gate3, hid_size, 1, false, true);
-            __bang_add_bias(n_hh_out, n_hh_out, g_b_hh, gate3);
+            // ==========================
+            // 手动计算 W_ih @ x + b_ih
+            // ==========================
+            for (int g = 0; g < G3; g++) {
+                float sum = g_b_ih[g];
+                for (int i = 0; i < I; i++) {
+                    sum += g_w_ih[g * I + i] * nx[i];
+                }
+                tmp0[g] = sum;
+            }
 
-            // 拆分三个门：z / r / n
-            float* n_iz = n_ih_out;
-            float* n_ir = n_ih_out + hid_size;
-            float* n_in = n_ih_out + 2 * hid_size;
+            // ==========================
+            // 手动计算 W_hh @ h_prev + b_hh
+            // ==========================
+            for (int g = 0; g < G3; g++) {
+                float sum = g_b_hh[g];
+                for (int k = 0; k < H; k++) {
+                    sum += g_w_hh[g * H + k] * h_prev[k];
+                }
+                tmp1[g] = sum;
+            }
 
-            float* n_hz = n_hh_out;
-            float* n_hr = n_hh_out + hid_size;
-            float* n_hn = n_hh_out + 2 * hid_size;
+            // z = sigmoid( z_x + z_h )
+            for (int k = 0; k < H; k++) {
+                float v = tmp0[k] + tmp1[k];
+                z[k] = 1.0f / (1.0f + __bang_exp(-v));
+            }
 
-            // 更新门 z
-            __bang_add(n_z, n_iz, n_hz, hid_size);
-            __bang_active_sigmoid(n_z, n_z, hid_size);
+            // r = sigmoid( r_x + r_h )
+            for (int k = 0; k < H; k++) {
+                float v = tmp0[H + k] + tmp1[H + k];
+                r[k] = 1.0f / (1.0f + __bang_exp(-v));
+            }
 
-            // 重置门 r
-            __bang_add(n_r, n_ir, n_hr, hid_size);
-            __bang_active_sigmoid(n_r, n_r, hid_size);
+            // n = tanh( n_x + r * n_h )
+            for (int k = 0; k < H; k++) {
+                float rh = r[k] * tmp1[2 * H + k];
+                float v = tmp0[2 * H + k] + rh;
+                n[k] = __bang_tanh(v);
+            }
 
-            // 候选隐状态 n
-            __bang_mul(n_hn, n_r, n_hn, hid_size);
-            __bang_add(n_n, n_in, n_hn, hid_size);
-            __bang_active_tanh(n_n, n_n, hid_size);
-
-            // 计算当前隐状态 h_t
-            __bang_sub_scalar(n_h_cur, n_z, 1.0f, hid_size);
-            __bang_mul(n_h_cur, n_h_cur, n_n, hid_size);
-            __bang_mul(n_z, n_z, n_h_prev, hid_size);
-            __bang_add(n_h_cur, n_h_cur, n_z, hid_size);
+            // h_t = (1 - z) * n + z * h_prev
+            for (int k = 0; k < H; k++) {
+                float one_z = 1.0f - z[k];
+                float val = one_z * n[k] + z[k] * h_prev[k];
+                tmp2[k] = val;
+            }
 
             // 写回输出
-            int out_offset = cur_b * seq_len * hid_size + t * hid_size;
-            __memcpy(g_out_hseq + out_offset, n_h_cur, hid_size * sizeof(float), NRAM2GDRAM);
+            int out_off = curB * T * H + t * H;
+            __memcpy(g_out_seq + out_off, tmp2, H * 4, NRAM2GDRAM);
 
-            // 更新上一时刻隐状态
-            __bang_copy(n_h_prev, n_h_cur, hid_size);
+            // 更新 h_prev（手动循环，无__bang_copy）
+            for (int k = 0; k < H; k++) {
+                h_prev[k] = tmp2[k];
+            }
         }
     }
 }
 
-// ===================== 对外接口：bang_func 严格合规 =====================
-// 入参包含所有权重 + 输入张量，完全移除 torch::get_parameter 等高阶API
+// ==========================
+// 对外接口 bang_func
+// ==========================
 torch::Tensor bang_func(
-    // 输入特征
     torch::Tensor input,
-    // 第0层权重
     torch::Tensor weight_ih_l0,
     torch::Tensor weight_hh_l0,
     torch::Tensor bias_ih_l0,
     torch::Tensor bias_hh_l0,
-    // 第1层权重
     torch::Tensor weight_ih_l1,
     torch::Tensor weight_hh_l1,
     torch::Tensor bias_ih_l1,
     torch::Tensor bias_hh_l1,
-    // 结构参数
     int input_size,
     int hidden_size,
     int num_layers
 ) {
-    // 输入校验（仅使用基础检查，无torch算子计算）
-    TORCH_CHECK(input.is_contiguous(), "GRU input must be contiguous");
-    TORCH_CHECK(input.dim() == 3, "Input shape: [batch, seq_len, input_size]");
+    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
+    TORCH_CHECK(input.dim() == 3, "input must be [B, T, C]");
 
-    // 统一转为 FP32 计算（题目强制要求）
     auto dtype = input.scalar_type();
-    torch::Tensor x = (dtype != torch::kFloat) ? input.to(torch::kFloat) : input;
+    torch::Tensor x = input.to(torch::kFloat);
 
-    int batch = x.size(0);
-    int seq_len = x.size(1);
-    torch::Tensor layer_in = x;
-    torch::Tensor layer_out;
+    int B = x.size(0);
+    int T = x.size(1);
+    torch::Tensor in = x;
+    torch::Tensor out;
 
-    // 逐层执行GRU
-    for (int layer = 0; layer < num_layers; ++layer) {
-        float* w_ih_ptr;
-        float* w_hh_ptr;
-        float* b_ih_ptr;
-        float* b_hh_ptr;
-        int cur_in_dim;
+    for (int L = 0; L < num_layers; L++) {
+        float *w_ih, *w_hh, *b_ih, *b_hh;
+        int is = (L == 0) ? input_size : hidden_size;
 
-        // 按层选择权重指针（直接取data_ptr，无torch算子调用）
-        if (layer == 0) {
-            w_ih_ptr = weight_ih_l0.data_ptr<float>();
-            w_hh_ptr = weight_hh_l0.data_ptr<float>();
-            b_ih_ptr = bias_ih_l0.data_ptr<float>();
-            b_hh_ptr = bias_hh_l0.data_ptr<float>();
-            cur_in_dim = input_size;
+        if (L == 0) {
+            w_ih = weight_ih_l0.data_ptr<float>();
+            w_hh = weight_hh_l0.data_ptr<float>();
+            b_ih = bias_ih_l0.data_ptr<float>();
+            b_hh = bias_hh_l0.data_ptr<float>();
         } else {
-            w_ih_ptr = weight_ih_l1.data_ptr<float>();
-            w_hh_ptr = weight_hh_l1.data_ptr<float>();
-            b_ih_ptr = bias_ih_l1.data_ptr<float>();
-            b_hh_ptr = bias_hh_l1.data_ptr<float>();
-            cur_in_dim = hidden_size;
+            w_ih = weight_ih_l1.data_ptr<float>();
+            w_hh = weight_hh_l1.data_ptr<float>();
+            b_ih = bias_ih_l1.data_ptr<float>();
+            b_hh = bias_hh_l1.data_ptr<float>();
         }
 
-        // 分配输出空间
-        layer_out = torch::empty({batch, seq_len, hidden_size}, x.options());
+        out = torch::empty({B, T, hidden_size}, x.options());
 
-        // 获取MLU流（不新建队列，严格遵守约束）
-        cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+        cnrtQueue_t q = torch_mlu::getCurMLUStream();
         cnrtDim3_t dim = {8, 1, 1};
-        cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+        cnrtFunctionType_t k = cnrtFuncTypeUnion1;
 
-        // 启动核函数（纯指针传递，无torch算子）
-        gru_layer_kernel<<<dim, ktype, queue>>>(
-            layer_in.data_ptr<float>(),
-            layer_out.data_ptr<float>(),
-            w_ih_ptr,
-            w_hh_ptr,
-            b_ih_ptr,
-            b_hh_ptr,
-            batch,
-            seq_len,
-            cur_in_dim,
-            hidden_size
+        gru_layer_kernel<<<dim, k, q>>>(
+            in.data_ptr<float>(),
+            out.data_ptr<float>(),
+            w_ih, w_hh, b_ih, b_hh,
+            B, T, is, hidden_size
         );
 
-        layer_in = layer_out;
+        in = out;
     }
 
-    // 转回原始精度返回
-    return (dtype != torch::kFloat) ? layer_out.to(dtype) : layer_out;
+    return out.to(dtype);
 }

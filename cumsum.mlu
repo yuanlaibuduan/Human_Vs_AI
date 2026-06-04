@@ -4,84 +4,69 @@
 
 #define CHUNK_SIZE 2048
 
-// 沿指定维度dim做前缀累加cumsum核函数，内部计算统一FP32
 __mlu_entry__ void cumsum_kernel(
     float* in_gdram,
     float* out_gdram,
-    int64_t outer_size,   // dim维度前面所有元素乘积：d0*d1*...d(dim-1)
-    int64_t dim_len,     // 当前累加维度长度：d_dim
-    int64_t inner_size   // dim维度后面所有元素乘积：d(dim+1)*...dn
+    int64_t outer_size,
+    int64_t dim_len,
+    int64_t inner_size
 ) {
     uint32_t core_idx = taskId;
     uint32_t core_cnt = taskDim;
 
-    // 任务拆分：按outer维度切分多核
     int64_t per_core = outer_size / core_cnt;
     int64_t rem = outer_size % core_cnt;
     int64_t core_start = core_idx * per_core + (core_idx < rem ? core_idx : rem);
     int64_t core_elem = per_core + (core_idx < rem ? 1 : 0);
 
-    // NRAM 必须全部用 __nram__ 声明
     __nram__ float nram_in[CHUNK_SIZE];
     __nram__ float nram_acc[CHUNK_SIZE];
     __nram__ float nram_out[CHUNK_SIZE];
 
-    // 遍历当前core负责的outer分片
-    for(int64_t outer = core_start; outer < core_start + core_elem; outer++){
-        for(int64_t inner_base = 0; inner_base < inner_size; inner_base += CHUNK_SIZE){
+    for (int64_t outer = core_start; outer < core_start + core_elem; outer++) {
+        for (int64_t inner_base = 0; inner_base < inner_size; inner_base += CHUNK_SIZE) {
             int64_t inner_rem = inner_size - inner_base;
             int64_t cur_inner = inner_rem > CHUNK_SIZE ? CHUNK_SIZE : inner_rem;
             int64_t align_len = (cur_inner + 63) & ~63;
 
-            // 累加器清零（必须放在NRAM）
-            __bang_zero(nram_acc, align_len);
+            // 手动循环清零，替代 __bang_zero，解决编译错误
+            for (int i = 0; i < align_len; i++) {
+                nram_acc[i] = 0.0f;
+            }
 
-            // 逐次沿dim方向累加，前缀和
-            for(int64_t d = 0; d < dim_len; d++){
+            for (int64_t d = 0; d < dim_len; d++) {
                 int64_t gdram_off = outer * dim_len * inner_size + d * inner_size + inner_base;
 
-                // 读入当前数据
                 __memcpy(nram_in, in_gdram + gdram_off, cur_inner * sizeof(float), GDRAM2NRAM);
-
-                // acc = acc + in
                 __bang_add(nram_out, nram_acc, nram_in, align_len);
-
-                // 更新累加器
                 __bang_move(nram_acc, nram_out, align_len);
-
-                // 写回结果
                 __memcpy(out_gdram + gdram_off, nram_out, cur_inner * sizeof(float), NRAM2GDRAM);
             }
         }
     }
 }
 
-// 对外接口：bang_func，参数x输入张量+dim维度
 torch::Tensor bang_func(torch::Tensor x, int dim) {
     TORCH_CHECK(x.is_contiguous(), "input tensor must be contiguous");
     auto origin_dtype = x.scalar_type();
 
-    // 统一转fp32
     torch::Tensor x_fp32 = (origin_dtype == torch::kFloat) ? x : x.to(torch::kFloat);
     auto out_fp32 = torch::empty_like(x_fp32);
 
     auto shape = x_fp32.sizes();
     int ndim = shape.size();
-    if(dim < 0) dim += ndim;
+    if (dim < 0) dim += ndim;
 
-    // 计算维度拆分参数
     int64_t outer = 1;
-    for(int i = 0; i < dim; i++) outer *= shape[i];
+    for (int i = 0; i < dim; i++) outer *= shape[i];
     int64_t dim_len = shape[dim];
     int64_t inner = 1;
-    for(int i = dim + 1; i < ndim; i++) inner *= shape[i];
+    for (int i = dim + 1; i < ndim; i++) inner *= shape[i];
 
-    // MLU 流
     cnrtQueue_t q = torch_mlu::getCurMLUStream();
     cnrtDim3_t grid = {8, 1, 1};
     cnrtFunctionType_t func_type = cnrtFuncTypeUnion1;
 
-    // 启动核函数
     cumsum_kernel<<<grid, func_type, q>>>(
         x_fp32.data_ptr<float>(),
         out_fp32.data_ptr<float>(),
@@ -90,8 +75,7 @@ torch::Tensor bang_func(torch::Tensor x, int dim) {
         inner
     );
 
-    // 恢复类型
-    if(origin_dtype != torch::kFloat)
+    if (origin_dtype != torch::kFloat)
         return out_fp32.to(origin_dtype);
     return out_fp32;
 }
