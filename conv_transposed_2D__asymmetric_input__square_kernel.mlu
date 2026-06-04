@@ -1,138 +1,84 @@
-// conv_transposed_2D__asymmetric_input__square_kernel.cpp
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
 
-#define CIN_TILE 8
-#define COUT_TILE 8
-#define H_TILE 16
-#define W_TILE 32
-#define W_EXT 36   // W_TILE + K - 1 = 34, padded to 36 for BANG alignment
-#define H_EXT (H_TILE + 2)  // 18
-#define K 3
-#define ALIGNED_N 32
+// 核函数：执行二维转置卷积（FP32）
+__mlu_entry__ void conv_transpose2d_kernel(
+    const float* input,          // 输入张量 [N, C_in, H_in, W_in]
+    const float* weight,         // 权重张量 [C_in, C_out_g, K, K]
+    const float* bias,           // 偏置张量 [C_out] (可为NULL)
+    int N, int C_in, int H_in, int W_in,
+    int C_out, int K,
+    int stride, int padding, int output_padding, int groups,
+    float* output,               // 输出张量 [N, C_out, H_out, W_out]
+    int H_out, int W_out) {
 
-__mlu_entry__ void convtransp2d_kernel(
-    float* input,
-    float* kernel_gdr,
-    float* output,
-    int B, int CI, int CO,
-    int HI, int WI,
-    int HO, int WO)
-{
-    uint32_t cid = taskId;
-    uint32_t cn = taskDim;
-    uint32_t bpc = B / cn;
-    uint32_t brem = B % cn;
-    uint32_t sb = cid * bpc + (cid < brem ? cid : brem);
-    uint32_t mb = bpc + (cid < brem ? 1 : 0);
+    // 计算每组输入/输出通道数
+    int C_out_per_group = C_out / groups;
+    int C_in_per_group  = C_in / groups;
 
-    // NRAM: 8*18*36 + 8*16*32 + 8*8*9 + 32 = 9888 floats = 39.5KB
-    __nram__ float ni[CIN_TILE][H_EXT][W_EXT];
-    __nram__ float na[COUT_TILE][H_TILE][W_TILE];
-    __nram__ float nk[CIN_TILE][COUT_TILE][K][K];
-    __nram__ float nram_temp[ALIGNED_N];
+    // 输出总元素个数
+    int total_out = N * C_out * H_out * W_out;
 
-    for (uint32_t b = 0; b < mb; b++) {
-        uint32_t bi = sb + b;
-        float* bin  = input  + bi * CI * HI * WI;
-        float* bout = output + bi * CO * HO * WO;
+    // 多核任务拆分
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+    uint32_t per_core = total_out / core_num;
+    uint32_t remainder = total_out % core_num;
+    uint32_t start = core_id * per_core + (core_id < remainder ? core_id : remainder);
+    uint32_t count = per_core + (core_id < remainder ? 1 : 0);
 
-        for (uint32_t co_g = 0; co_g < CO; co_g += COUT_TILE) {
-            uint32_t cot = (co_g + COUT_TILE <= CO) ? COUT_TILE : (CO - co_g);
+    // 处理本core负责的连续输出元素
+    for (uint32_t idx = start; idx < start + count; ++idx) {
+        // 将一维索引解析为 (n, c_out, h_out, w_out)
+        int n = idx / (C_out * H_out * W_out);
+        int t = idx % (C_out * H_out * W_out);
+        int c_out = t / (H_out * W_out);
+        int t2 = t % (H_out * W_out);
+        int h_out = t2 / W_out;
+        int w_out = t2 % W_out;
 
-            for (uint32_t ho = 0; ho < HO; ho += H_TILE) {
-                uint32_t ht = (ho + H_TILE <= HO) ? H_TILE : (HO - ho);
-                uint32_t he = ht + K - 1;
+        // 确定分组
+        int group_id = c_out / C_out_per_group;
+        int c_out_group = c_out % C_out_per_group;
+        int c_in_start = group_id * C_in_per_group;
+        int c_in_end   = c_in_start + C_in_per_group;
 
-                for (uint32_t wo = 0; wo < WO; wo += W_TILE) {
-                    uint32_t wt = (wo + W_TILE <= WO) ? W_TILE : (WO - wo);
-                    uint32_t we = wt + K - 1;
+        float sum = 0.0f;
 
-                    // Zero accumulator (only wt elements needed)
-                    for (uint32_t co = 0; co < cot; co++)
-                        for (uint32_t i = 0; i < ht; i++)
-                            for (uint32_t j = 0; j < wt; j++)
-                                na[co][i][j] = 0.0f;
-
-                    for (uint32_t ci_g = 0; ci_g < CI; ci_g += CIN_TILE) {
-                        uint32_t cit = (ci_g + CIN_TILE <= CI) ? CIN_TILE : (CI - ci_g);
-
-                        // Load kernel and input
-                        for (uint32_t ci = 0; ci < cit; ci++) {
-                            uint32_t gci = ci_g + ci;
-
-                            // Load flipped kernel for all co
-                            for (uint32_t co = 0; co < cot; co++) {
-                                uint32_t gco = co_g + co;
-                                for (uint32_t kh = 0; kh < K; kh++)
-                                    for (uint32_t kw = 0; kw < K; kw++)
-                                        nk[ci][co][kh][kw] = kernel_gdr[
-                                            (gci * CO + gco) * K * K
-                                            + (K - 1 - kh) * K
-                                            + (K - 1 - kw)];
-                            }
-
-                            // Zero input tile (full W_EXT per row)
-                            for (uint32_t i = 0; i < he; i++)
-                                for (uint32_t j = 0; j < W_EXT; j++)
-                                    ni[ci][i][j] = 0.0f;
-
-                            // Load valid input region
-                            int prs = (int)ho;
-                            int pre = (int)(ho + he - 1);
-                            int vs = K - 1;
-                            int ve = K - 1 + HI - 1;
-                            int cs = (prs > vs) ? prs : vs;
-                            int ce = (pre < ve) ? pre : ve;
-
-                            for (int r = cs; r <= ce; r++) {
-                                int ir = r - (K - 1);
-                                int pcs = (int)wo;
-                                int pce = (int)(wo + we - 1);
-                                int wvs = K - 1;
-                                int wve = K - 1 + WI - 1;
-                                int wcs = (pcs > wvs) ? pcs : wvs;
-                                int wce = (pce < wve) ? pce : wve;
-                                if (wcs <= wce)
-                                    __memcpy(
-                                        &ni[ci][r - (int)ho][wcs - (int)wo],
-                                        bin + gci * HI * WI + ir * WI + (wcs - (K - 1)),
-                                        (wce - wcs + 1) * sizeof(float),
-                                        GDRAM2NRAM);
-                            }
-                        }
-
-                        // Convolution using BANG SIMD (processes W_TILE=32 elements at once)
-                        for (uint32_t co = 0; co < cot; co++)
-                            for (uint32_t ci = 0; ci < cit; ci++)
-                                for (uint32_t kh = 0; kh < K; kh++)
-                                    for (uint32_t hi = 0; hi < ht; hi++)
-                                        for (uint32_t kw = 0; kw < K; kw++) {
-                                            float wk = nk[ci][co][kh][kw];
-                                            // nram_temp[0..31] = wk * ni[ci][hi+kh][kw..kw+31]
-                                            __bang_mul_scalar(nram_temp, &ni[ci][hi + kh][kw], wk, ALIGNED_N);
-                                            // na[co][hi][0..31] += nram_temp[0..31]
-                                            __bang_add(na[co][hi], na[co][hi], nram_temp, ALIGNED_N);
-                                        }
-                    }
-
-                    // Store output tile (only wt elements per row)
-                    for (uint32_t co = 0; co < cot; co++) {
-                        uint32_t gco = co_g + co;
-                        for (uint32_t hi = 0; hi < ht; hi++)
-                            __memcpy(
-                                bout + gco * HO * WO + (ho + hi) * WO + wo,
-                                na[co][hi],
-                                wt * sizeof(float),
-                                NRAM2GDRAM);
+        // 遍历输入通道和卷积核
+        for (int c_in = c_in_start; c_in < c_in_end; ++c_in) {
+            for (int kh = 0; kh < K; ++kh) {
+                for (int kw = 0; kw < K; ++kw) {
+                    // 计算对应的输入空间位置 (h_in, w_in)
+                    int h_in_num = h_out + padding - kh;
+                    int w_in_num = w_out + padding - kw;
+                    if (h_in_num % stride != 0 || w_in_num % stride != 0)
+                        continue;
+                    int h_in = h_in_num / stride;
+                    int w_in = w_in_num / stride;
+                    if (h_in >= 0 && h_in < H_in && w_in >= 0 && w_in < W_in) {
+                        // 输入索引
+                        int input_idx = ((n * C_in + c_in) * H_in + h_in) * W_in + w_in;
+                        // 权重索引: [c_in, c_out_group, kh, kw]
+                        int weight_idx = ((c_in * C_out_per_group + c_out_group) * K + kh) * K + kw;
+                        sum += input[input_idx] * weight[weight_idx];
                     }
                 }
             }
         }
+
+        // 添加偏置（如果存在）
+        if (bias != NULL) {
+            sum += bias[c_out];
+        }
+
+        // 写回输出
+        output[idx] = sum;
     }
 }
 
+// 对外接口函数
 torch::Tensor bang_func(
     torch::Tensor x,
     torch::Tensor kernel,
@@ -143,40 +89,66 @@ torch::Tensor bang_func(
     int padding,
     int output_padding,
     int groups,
-    bool bias)
-{
-    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
-    TORCH_CHECK(kernel.is_contiguous(), "Kernel must be contiguous");
+    bool bias) {
 
-    auto odt = x.scalar_type();
-    torch::Tensor ifp = x;
-    torch::Tensor kfp = kernel;
-    if (odt != torch::kFloat) {
-        ifp = x.to(torch::kFloat);
-        kfp = kernel.to(torch::kFloat);
+    // 输入检查与类型转换（统一转为 FP32）
+    auto original_dtype = x.scalar_type();
+    x = x.contiguous();
+    kernel = kernel.contiguous();
+
+    torch::Tensor x_fp32 = (original_dtype == torch::kFloat) ? x : x.to(torch::kFloat);
+    torch::Tensor kernel_fp32 = (kernel.scalar_type() == torch::kFloat) ? kernel : kernel.to(torch::kFloat);
+
+    // 确保输入位于 MLU 设备上
+    if (!x_fp32.device().is_mlu()) x_fp32 = x_fp32.to(torch::kMLU);
+    if (!kernel_fp32.device().is_mlu()) kernel_fp32 = kernel_fp32.to(torch::kMLU);
+
+    // 提取形状信息
+    int N = x_fp32.size(0);
+    int C_in = x_fp32.size(1);
+    int H_in = x_fp32.size(2);
+    int W_in = x_fp32.size(3);
+    int C_out = out_channels;
+    int K = kernel_size;
+
+    // 计算输出空间尺寸
+    int H_out = (H_in - 1) * stride - 2 * padding + K + output_padding;
+    int W_out = (W_in - 1) * stride - 2 * padding + K + output_padding;
+
+    // 分配输出张量 (MLU, FP32)
+    torch::Tensor output_fp32 = torch::empty({N, C_out, H_out, W_out}, x_fp32.options().dtype(torch::kFloat));
+    output_fp32 = output_fp32.to(torch::kMLU);
+
+    // 准备偏置张量（如果需要）
+    torch::Tensor bias_tensor;
+    float* bias_ptr = nullptr;
+    if (bias) {
+        bias_tensor = torch::zeros({C_out}, x_fp32.options().dtype(torch::kFloat)).to(torch::kMLU);
+        bias_ptr = bias_tensor.data_ptr<float>();
     }
 
-    int B  = ifp.size(0);
-    int CI = ifp.size(1);
-    int HI = ifp.size(2);
-    int WI = ifp.size(3);
-    int CO = out_channels;
-    int KS = kernel_size;
-    int HO = (HI - 1) * stride - 2 * padding + KS + output_padding;
-    int WO = (WI - 1) * stride - 2 * padding + KS + output_padding;
+    // 获取 MLU 队列
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
-    auto ofp = torch::empty({B, CO, HO, WO}, ifp.options());
+    // 配置核函数启动参数（使用 4 个核心，可根据实际调整）
+    cnrtDim3_t dim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
-    cnrtQueue_t q = torch_mlu::getCurMLUStream();
-    cnrtDim3_t d = {4, 1, 1};
+    // 启动核函数
+    conv_transpose2d_kernel<<<dim, ktype, queue>>>(
+        x_fp32.data_ptr<float>(),
+        kernel_fp32.data_ptr<float>(),
+        bias_ptr,
+        N, C_in, H_in, W_in,
+        C_out, K,
+        stride, padding, output_padding, groups,
+        output_fp32.data_ptr<float>(),
+        H_out, W_out
+    );
 
-    convtransp2d_kernel<<<d, cnrtFuncTypeUnion1, q>>>(
-        ifp.data_ptr<float>(),
-        kfp.data_ptr<float>(),
-        ofp.data_ptr<float>(),
-        B, CI, CO, HI, WI, HO, WO);
-
-    if (odt != torch::kFloat)
-        return ofp.to(odt);
-    return ofp;
+    // 将结果转回原始数据类型（如果输入不是 FP32）
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
+    }
+    return output_fp32;
 }

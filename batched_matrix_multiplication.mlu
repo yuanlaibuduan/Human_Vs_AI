@@ -1,13 +1,58 @@
-// batched_matrix_multiplication.cpp
-// Uses tensor.bmm() method which internally calls the same hardware GEMM unit
-// as torch::bmm, ensuring exact precision match.
+// 004_batched_matrix_multiplication.mlu
+#include <bang.h>
 #include <torch/extension.h>
+#include <cnrt.h>
 
+// 核函数：批量矩阵乘法，每个核处理一部分批次
+__mlu_entry__ void batched_matmul_kernel(
+    float* A,
+    float* B,
+    float* C,
+    int batch_size,
+    int m,
+    int k,
+    int n) {
+    
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+
+    // 每个核处理的批次数量（向上取整）
+    int batches_per_core = (batch_size + core_num - 1) / core_num;
+    int start_batch = core_id * batches_per_core;
+    int end_batch = start_batch + batches_per_core;
+    if (end_batch > batch_size) end_batch = batch_size;
+
+    // 对每个批次调用 __bang_matmul
+    for (int b = start_batch; b < end_batch; ++b) {
+        float* A_batch = A + b * m * k;
+        float* B_batch = B + b * k * n;
+        float* C_batch = C + b * m * n;
+
+        // 矩阵乘法：C_batch = A_batch * B_batch
+        // 参数说明：目标C，源A，源B，m, n, k,
+        //          C的leading dimension = n,
+        //          A的leading dimension = k,
+        //          B的leading dimension = n,
+        //          alpha=1.0f, beta=0.0f
+        __bang_matmul(C_batch, A_batch, B_batch,
+                      m, n, k,
+                      n,       // ldc
+                      k,       // lda
+                      n,       // ldb
+                      1.0f, 0.0f,
+                      NULL, NULL, NULL, 0);
+    }
+}
+
+// 对外接口函数
 torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
-    TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
-    TORCH_CHECK(B.is_contiguous(), "B must be contiguous");
+    // 检查输入张量是否连续（内存布局）
+    TORCH_CHECK(A.is_contiguous(), "Input A must be contiguous");
+    TORCH_CHECK(B.is_contiguous(), "Input B must be contiguous");
 
+    // 保存原始数据类型
     auto original_dtype = A.scalar_type();
+    // 如果输入不是 float32，则转换为 float32 进行计算
     torch::Tensor A_fp32 = A;
     torch::Tensor B_fp32 = B;
     if (original_dtype != torch::kFloat) {
@@ -15,9 +60,41 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
         B_fp32 = B.to(torch::kFloat);
     }
 
-    // Use tensor method bmm() which calls the same hardware GEMM as torch::bmm
-    auto C_fp32 = A_fp32.bmm(B_fp32);
+    // 获取输入张量的形状信息
+    auto sizes = A_fp32.sizes();
+    TORCH_CHECK(sizes.size() == 3, "Input A must be 3D");
+    auto B_sizes = B_fp32.sizes();
+    TORCH_CHECK(B_sizes.size() == 3, "Input B must be 3D");
+    TORCH_CHECK(sizes[0] == B_sizes[0], "Batch size mismatch");
+    TORCH_CHECK(sizes[2] == B_sizes[1], "k dimension mismatch: A.shape[2] must equal B.shape[1]");
 
+    int batch_size = sizes[0];
+    int m = sizes[1];
+    int k = sizes[2];
+    int n = B_sizes[2];
+
+    // 分配输出张量（形状 [batch_size, m, n]）
+    torch::Tensor C_fp32 = torch::empty({batch_size, m, n}, torch::dtype(torch::kFloat).device(A.device()));
+
+    // 获取当前 MLU 流队列
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    // 设置核函数启动维度：使用 Union1 类型，4 个核（可根据需要调整）
+    cnrtDim3_t dim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    // 启动核函数
+    batched_matmul_kernel<<<dim, ktype, queue>>>(
+        A_fp32.data_ptr<float>(),
+        B_fp32.data_ptr<float>(),
+        C_fp32.data_ptr<float>(),
+        batch_size,
+        m,
+        k,
+        n
+    );
+
+    // 将结果转回原始数据类型（如果需要）
     if (original_dtype != torch::kFloat) {
         return C_fp32.to(original_dtype);
     }
