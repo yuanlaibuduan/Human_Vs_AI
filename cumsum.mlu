@@ -3,24 +3,38 @@
 #include <cnrt.h>
 #include <vector>
 
-__mlu_entry__ void cumsum_kernel(float* input, float* output,
-                                 const int64_t* offsets,
-                                 int dim_size, int64_t stride_dim,
-                                 int num_seqs) {
+#define BLOCK_SIZE 4096
+
+// 核函数：处理2D张量的每一行，沿列方向计算前缀和
+// input: [batch, dim_size] 连续的行主序
+// output: [batch, dim_size]
+// dim_size: 列数
+__mlu_entry__ void cumsum_2d_kernel(float* input, float* output,
+                                    int batch, int dim_size) {
+    __nram__ float nram_buf[BLOCK_SIZE];
     uint32_t core_id = taskId;
     uint32_t core_num = taskDim;
-    int seqs_per_core = (num_seqs + core_num - 1) / core_num;
-    int start_seq = core_id * seqs_per_core;
-    int end_seq = start_seq + seqs_per_core;
-    if (end_seq > num_seqs) end_seq = num_seqs;
+    int rows_per_core = (batch + core_num - 1) / core_num;
+    int start_row = core_id * rows_per_core;
+    int end_row = start_row + rows_per_core;
+    if (end_row > batch) end_row = batch;
 
-    for (int s = start_seq; s < end_seq; ++s) {
-        int64_t base = offsets[s];
+    for (int r = start_row; r < end_row; ++r) {
+        float* row_in = input + r * dim_size;
+        float* row_out = output + r * dim_size;
         float prefix = 0.0f;
-        for (int i = 0; i < dim_size; ++i) {
-            int64_t idx = base + i * stride_dim;
-            prefix += input[idx];
-            output[idx] = prefix;
+        for (int blk = 0; blk < dim_size; blk += BLOCK_SIZE) {
+            int len = dim_size - blk;
+            if (len > BLOCK_SIZE) len = BLOCK_SIZE;
+            // 拷贝到 NRAM
+            __memcpy(nram_buf, row_in + blk, len * sizeof(float), GDRAM2NRAM);
+            // 前缀和累加（标量循环）
+            for (int i = 0; i < len; ++i) {
+                prefix += nram_buf[i];
+                nram_buf[i] = prefix;
+            }
+            // 写回
+            __memcpy(row_out + blk, nram_buf, len * sizeof(float), NRAM2GDRAM);
         }
     }
 }
@@ -29,63 +43,55 @@ torch::Tensor bang_func(torch::Tensor x, int dim) {
     int ndim = x.dim();
     if (dim < 0) dim += ndim;
     TORCH_CHECK(dim >= 0 && dim < ndim, "Invalid dim");
+
     x = x.contiguous();
     auto original_dtype = x.scalar_type();
     torch::Tensor input_fp32 = (original_dtype == torch::kFloat) ? x : x.to(torch::kFloat);
-    torch::Tensor output_fp32 = torch::empty_like(input_fp32);
 
-    int64_t dim_size = input_fp32.size(dim);
-    int64_t stride_dim = input_fp32.stride(dim);
-    int64_t total_elements = input_fp32.numel();
-    int64_t num_seqs = total_elements / dim_size;
-
-    // 计算偏移量：枚举其他维度
-    std::vector<int64_t> other_dims, other_strides;
+    // 将输入重排为2D: [batch, dim_size]
+    // 首先将除dim以外的所有维度合并为 batch 维度
+    std::vector<int64_t> shape = input_fp32.sizes().vec();
+    int64_t dim_size = shape[dim];
+    int64_t batch = 1;
     for (int d = 0; d < ndim; ++d) {
-        if (d != dim) {
-            other_dims.push_back(input_fp32.size(d));
-            other_strides.push_back(input_fp32.stride(d));
-        }
-    }
-    int other_rank = other_dims.size();
-    std::vector<int64_t> host_offsets(num_seqs);
-    if (other_rank == 0) {
-        host_offsets[0] = 0;
-    } else {
-        std::vector<int64_t> idx(other_rank, 0);
-        for (int64_t s = 0; s < num_seqs; ++s) {
-            int64_t offset = 0;
-            for (int i = 0; i < other_rank; ++i)
-                offset += idx[i] * other_strides[i];
-            host_offsets[s] = offset;
-            // 进位
-            for (int i = other_rank - 1; i >= 0; --i) {
-                if (++idx[i] < other_dims[i]) break;
-                idx[i] = 0;
-            }
-        }
+        if (d != dim) batch *= shape[d];
     }
 
-    int64_t* dev_offsets = nullptr;
-    size_t offsets_bytes = num_seqs * sizeof(int64_t);
-    cnrtMalloc((void**)&dev_offsets, offsets_bytes);
-    cnrtMemcpy(dev_offsets, host_offsets.data(), offsets_bytes, CNRT_MEM_TRANS_DIR_HOST2DEV);
+    // 重排内存布局：将dim维移到最后一维，其他维合并到第一维
+    // 使用 permute + flatten 的方式
+    std::vector<int64_t> perm(ndim);
+    for (int d = 0, idx = 0; d < ndim; ++d) {
+        if (d == dim) continue;
+        perm[idx++] = d;
+    }
+    perm.push_back(dim);
+    auto input_perm = input_fp32.permute(perm);
+    auto input_2d = input_perm.reshape({batch, dim_size});
 
+    auto output_2d = torch::empty_like(input_2d);
+
+    // 获取 MLU 队列
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t dim3 = {1024, 1, 1};
+    cnrtDim3_t dim3 = {256, 1, 1};   // 256个核
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
-    cumsum_kernel<<<dim3, ktype, queue>>>(
-        input_fp32.data_ptr<float>(),
-        output_fp32.data_ptr<float>(),
-        dev_offsets,
-        static_cast<int>(dim_size),
-        stride_dim,
-        static_cast<int>(num_seqs)
-    );
-    cnrtQueueSync(queue);
-    cnrtFree(dev_offsets);
 
-    if (original_dtype != torch::kFloat)
-        return output_fp32.to(original_dtype);
-    return output_fp32;
+    cumsum_2d_kernel<<<dim3, ktype, queue>>>(
+        input_2d.data_ptr<float>(),
+        output_2d.data_ptr<float>(),
+        static_cast<int>(batch),
+        static_cast<int>(dim_size)
+    );
+
+    cnrtQueueSync(queue);
+
+    // 将输出重排回原始形状
+    auto output_perm = output_2d.reshape(input_perm.sizes());
+    std::vector<int64_t> inv_perm(ndim);
+    for (int d = 0; d < ndim; ++d) inv_perm[perm[d]] = d;
+    auto output = output_perm.permute(inv_perm);
+
+    if (original_dtype != torch::kFloat) {
+        return output.to(original_dtype);
+    }
+    return output;
 }
