@@ -2,53 +2,118 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
+// 定义 NRAM 分块大小，建议为 64 的倍数以对齐内存访问
 #define CHUNK_SIZE 4096
 
-__mlu_entry__ void sqrt_abs_kernel(float *input, float *output, int total) {
+/**
+ * @brief BangC 核函数：执行 sqrt(abs(x)) 操作
+ *
+ * @param input   输入张量指针 (GDRAM)
+ * @param output  输出张量指针 (GDRAM)
+ * @param total   总元素个数
+ */
+__mlu_entry__ void sqrt_abs_kernel(
+    float *input,
+    float *output,
+    int total) {
+
+    // 1. 获取多核并行参数
     uint32_t core_id = taskId;
     uint32_t core_num = taskDim;
+
+    // 2. 计算当前核心需要处理的数据范围
+    // 采用动态负载均衡策略处理无法整除的情况
     uint32_t per_core = total / core_num;
-    uint32_t start = core_id * per_core;
-    uint32_t count = per_core;
-    if (core_id == core_num - 1) count += total % core_num;
+    uint32_t remainder = total % core_num;
 
-    __nram__ float nram_data[CHUNK_SIZE];
+    uint32_t start = core_id * per_core +
+                     (core_id < remainder ? core_id : remainder);
 
+    uint32_t count = per_core +
+                     (core_id < remainder ? 1 : 0);
+
+    // 3. 分配 NRAM 缓冲区
+    // nram_input: 用于存储从 GDRAM 搬运进来的数据
+    // nram_output: 用于存储计算结果
+    __nram__ float nram_input[CHUNK_SIZE];
+    __nram__ float nram_output[CHUNK_SIZE];
+
+    // 4. 循环处理数据块
     for (uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
-        uint32_t len = (offset + CHUNK_SIZE <= count) ? CHUNK_SIZE : (count - offset);
-        uint32_t aligned_len = (len + 63) & ~63;
+        // 计算当前块的长度
+        uint32_t len = (offset + CHUNK_SIZE <= count)
+                           ? CHUNK_SIZE
+                           : (count - offset);
 
-        __memcpy(nram_data, input + start + offset, len * sizeof(float), GDRAM2NRAM);
-        __bang_active_abs(nram_data, nram_data, aligned_len);
-        __bang_active_sqrt(nram_data, nram_data, aligned_len);
-        __memcpy(output + start + offset, nram_data, len * sizeof(float), NRAM2GDRAM);
+        // 计算对齐后的长度（BangC 指令通常要求 64 字节对齐，即 16 个 float）
+        uint32_t aligned_len = (len + 15) & ~15;
+
+        // 5. 数据搬运：GDRAM -> NRAM
+        __memcpy(nram_input, input + start + offset, len * sizeof(float), GDRAM2NRAM);
+
+        // 6. 执行计算：先取绝对值，再开方
+        // 步骤 A: abs(x)
+        __bang_active_abs(nram_output, nram_input, aligned_len);
+
+        // 步骤 B: sqrt(|x|)
+        __bang_active_sqrt(nram_output, nram_output, aligned_len);
+
+        // 7. 数据搬运：NRAM -> GDRAM
+        __memcpy(output + start + offset, nram_output, len * sizeof(float), NRAM2GDRAM);
     }
 }
 
+/**
+ * @brief 外部调用的 C++ Wrapper 函数
+ *
+ * @param input 输入 Tensor
+ * @return torch::Tensor 输出 Tensor
+ */
 torch::Tensor bang_func(torch::Tensor input) {
+    // 1. 检查输入连续性
     TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
+
+    // 2. 保存原始数据类型，用于最后恢复
     auto original_dtype = input.scalar_type();
+
+    // 3. 确保内部计算使用 fp32
     torch::Tensor input_fp32 = input;
     if (original_dtype != torch::kFloat) {
         input_fp32 = input.to(torch::kFloat);
     }
+
+    // 4. 分配输出 Tensor
     auto output_fp32 = torch::empty_like(input_fp32);
+
+    // 5. 获取总元素数
     int total = input_fp32.numel();
 
-    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t dim = {4, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+    // 如果元素数为 0，直接返回空张量，避免启动核函数报错
+    if (total == 0) {
+        return output_fp32.to(original_dtype);
+    }
 
-    sqrt_abs_kernel<<<dim, ktype, queue>>>(
+    // 6. 获取当前 MLU 队列
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    // 7. 配置核函数启动参数
+    // dim.x=4 表示使用 4 个核心 (根据硬件情况调整，通常寒武纪 MLU270/290 为 4 或 8 核)
+    cnrtDim3_t k_dim = {4, 1, 1};
+    cnrtFunctionType_t k_type = cnrtFuncTypeUnion1;
+
+    // 8. 启动核函数
+    sqrt_abs_kernel<<<k_dim, k_type, queue>>>(
         input_fp32.data_ptr<float>(),
         output_fp32.data_ptr<float>(),
-        total
-    );
+        total);
 
-    cnrtQueueSync(queue);
+    // 9. 同步等待计算完成 (可选，视框架调度机制而定，通常 PyTorch 异步调度不需要显式 sync)
+    // cnrtSyncQueue(queue);
 
+    // 10. 将结果转回原始数据类型并返回
     if (original_dtype != torch::kFloat) {
         return output_fp32.to(original_dtype);
     }
+
     return output_fp32;
 }

@@ -1,97 +1,102 @@
 #include <bang.h>
-#include <torch/extension.h>
 #include <cnrt.h>
-#include <vector>
+#include <torch/extension.h>
 
-#define BLOCK_SIZE 4096
+#define MAX_DIM 8
 
-// 核函数：处理2D张量的每一行，沿列方向计算前缀和
-// input: [batch, dim_size] 连续的行主序
-// output: [batch, dim_size]
-// dim_size: 列数
-__mlu_entry__ void cumsum_2d_kernel(float* input, float* output,
-                                    int batch, int dim_size) {
-    __nram__ float nram_buf[BLOCK_SIZE];
+// 核函数：沿指定维度计算累加前缀和（fp32版本）
+// 参数：
+//   input   : 输入张量指针（fp32）
+//   output  : 输出张量指针（fp32）
+//   seq_len : 指定维度的长度（每个序列的元素个数）
+//   post_size : 指定维度之后所有维度的元素个数乘积，同时也是相邻元素在内存中的步长
+//   num_seqs : 序列总数（= total_elements / seq_len）
+//   total_elements : 总元素个数（用于边界检查，可选）
+__mlu_entry__ void cumsum_kernel(float *input, float *output, int seq_len,
+                                 int post_size, int num_seqs, int total_elements) {
     uint32_t core_id = taskId;
     uint32_t core_num = taskDim;
-    int rows_per_core = (batch + core_num - 1) / core_num;
-    int start_row = core_id * rows_per_core;
-    int end_row = start_row + rows_per_core;
-    if (end_row > batch) end_row = batch;
 
-    for (int r = start_row; r < end_row; ++r) {
-        float* row_in = input + r * dim_size;
-        float* row_out = output + r * dim_size;
-        float prefix = 0.0f;
-        for (int blk = 0; blk < dim_size; blk += BLOCK_SIZE) {
-            int len = dim_size - blk;
-            if (len > BLOCK_SIZE) len = BLOCK_SIZE;
-            // 拷贝到 NRAM
-            __memcpy(nram_buf, row_in + blk, len * sizeof(float), GDRAM2NRAM);
-            // 前缀和累加（标量循环）
-            for (int i = 0; i < len; ++i) {
-                prefix += nram_buf[i];
-                nram_buf[i] = prefix;
-            }
-            // 写回
-            __memcpy(row_out + blk, nram_buf, len * sizeof(float), NRAM2GDRAM);
+    // 将序列均匀分配给各个 core
+    uint32_t per_core = num_seqs / core_num;
+    uint32_t remainder = num_seqs % core_num;
+    uint32_t start_seq = core_id * per_core + (core_id < remainder ? core_id : remainder);
+    uint32_t local_seq_num = per_core + (core_id < remainder ? 1 : 0);
+
+    // 处理分配给当前 core 的每一个序列
+    for (uint32_t s = 0; s < local_seq_num; ++s) {
+        uint32_t seq_idx = start_seq + s;               // 当前序列的全局编号
+        // 计算当前序列第一个元素在内存中的偏移量
+        // 公式：offset0 = (seq_idx / post_size) * (seq_len * post_size) + (seq_idx % post_size)
+        uint32_t pre_idx = seq_idx / post_size;          // 前缀维度索引
+        uint32_t post_idx = seq_idx % post_size;         // 后缀维度索引
+        uint32_t base_offset = pre_idx * (seq_len * post_size) + post_idx;
+
+        float running_sum = 0.0f;
+        // 遍历序列中的每一个元素
+        for (int i = 0; i < seq_len; ++i) {
+            uint32_t offset = base_offset + i * post_size;
+            // 边界检查（可选，确保不越界）
+            if (offset >= (uint32_t)total_elements) break;
+            float val = input[offset];
+            running_sum += val;
+            output[offset] = running_sum;
         }
     }
 }
 
+// 对外暴露的接口函数
 torch::Tensor bang_func(torch::Tensor x, int dim) {
+    // 处理负数维度
     int ndim = x.dim();
     if (dim < 0) dim += ndim;
-    TORCH_CHECK(dim >= 0 && dim < ndim, "Invalid dim");
+    TORCH_CHECK(dim >= 0 && dim < ndim, "Invalid dim ", dim, " for tensor with ", ndim, " dimensions");
 
-    x = x.contiguous();
+    // 确保输入是 contiguous 的，或者我们自己处理 stride（简化起见，要求 contiguous）
+    TORCH_CHECK(x.is_contiguous(), "Input tensor must be contiguous");
+
+    // 保留原始数据类型
     auto original_dtype = x.scalar_type();
-    torch::Tensor input_fp32 = (original_dtype == torch::kFloat) ? x : x.to(torch::kFloat);
 
-    // 将输入重排为2D: [batch, dim_size]
-    // 首先将除dim以外的所有维度合并为 batch 维度
-    std::vector<int64_t> shape = input_fp32.sizes().vec();
-    int64_t dim_size = shape[dim];
-    int64_t batch = 1;
-    for (int d = 0; d < ndim; ++d) {
-        if (d != dim) batch *= shape[d];
+    // 转换为 fp32 进行计算
+    torch::Tensor x_fp32 = x;
+    if (original_dtype != torch::kFloat) {
+        x_fp32 = x.to(torch::kFloat);
     }
 
-    // 重排内存布局：将dim维移到最后一维，其他维合并到第一维
-    // 使用 permute + flatten 的方式
-    std::vector<int64_t> perm(ndim);
-    for (int d = 0, idx = 0; d < ndim; ++d) {
-        if (d == dim) continue;
-        perm[idx++] = d;
+    // 分配输出张量
+    torch::Tensor out_fp32 = torch::empty_like(x_fp32);
+
+    // 获取张量形状信息
+    auto sizes = x_fp32.sizes();
+    int64_t seq_len = sizes[dim];                     // 指定维度的长度
+    int64_t post_size = 1;                            // 后缀维度的总元素个数
+    for (int d = dim + 1; d < ndim; ++d) {
+        post_size *= sizes[d];
     }
-    perm.push_back(dim);
-    auto input_perm = input_fp32.permute(perm);
-    auto input_2d = input_perm.reshape({batch, dim_size});
+    int64_t num_seqs = x_fp32.numel() / seq_len;      // 序列总数
+    int64_t total = x_fp32.numel();
 
-    auto output_2d = torch::empty_like(input_2d);
-
-    // 获取 MLU 队列
+    // 获取当前 MLU 流对应的队列
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t dim3 = {256, 1, 1};   // 256个核
+
+    // 设置核函数启动参数（使用 16 个 core，可根据实际情况调整）
+    cnrtDim3_t dim_core = {16, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
-    cumsum_2d_kernel<<<dim3, ktype, queue>>>(
-        input_2d.data_ptr<float>(),
-        output_2d.data_ptr<float>(),
-        static_cast<int>(batch),
-        static_cast<int>(dim_size)
+    // 启动核函数
+    cumsum_kernel<<<dim_core, ktype, queue>>>(
+        x_fp32.data_ptr<float>(),
+        out_fp32.data_ptr<float>(),
+        (int)seq_len,
+        (int)post_size,
+        (int)num_seqs,
+        (int)total
     );
 
-    cnrtQueueSync(queue);
-
-    // 将输出重排回原始形状
-    auto output_perm = output_2d.reshape(input_perm.sizes());
-    std::vector<int64_t> inv_perm(ndim);
-    for (int d = 0; d < ndim; ++d) inv_perm[perm[d]] = d;
-    auto output = output_perm.permute(inv_perm);
-
+    // 将输出转换回原始数据类型
     if (original_dtype != torch::kFloat) {
-        return output.to(original_dtype);
+        return out_fp32.to(original_dtype);
     }
-    return output;
+    return out_fp32;
 }
