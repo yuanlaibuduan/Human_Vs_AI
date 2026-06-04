@@ -25,15 +25,12 @@ __mlu_entry__ void multi_layer_gru_kernel(
     int aligned_input_size = ALIGN(input_size);
     int aligned_hidden_size = ALIGN(hidden_size);
     if (aligned_input_size > MAX_DIM || aligned_hidden_size > MAX_DIM) {
-        // 若超出，直接返回（实际应用中应在 host 端做检查）
         return;
     }
 
-    // 获取核心 ID 和核心总数
     uint32_t core_id = taskId;
     uint32_t core_num = taskDim;
 
-    // 每个核心处理的 batch 数量
     int batch_per_core = batch / core_num;
     int rem = batch % core_num;
     int start_batch = core_id * batch_per_core + (core_id < rem ? core_id : rem);
@@ -49,19 +46,14 @@ __mlu_entry__ void multi_layer_gru_kernel(
     __nram__ float nram_n[MAX_DIM];
     __nram__ float nram_tmp[MAX_DIM];
 
-    // 遍历每个 batch
     for (int b = start_batch; b < end_batch; ++b) {
-        // 当前 batch 的输入基地址（第一层）
         const float* batch_input = input + b * seq_len * input_size;
-        // 当前 batch 的输出基地址（最后一层）
         float* batch_output = output + b * seq_len * hidden_size;
 
-        // 逐层计算
         for (int l = 0; l < num_layers; ++l) {
             int in_dim = (l == 0) ? input_size : hidden_size;
             int aligned_in_dim = ALIGN(in_dim);
 
-            // 当前层的输入指针
             const float* layer_input;
             if (l == 0) {
                 layer_input = batch_input;
@@ -70,7 +62,6 @@ __mlu_entry__ void multi_layer_gru_kernel(
                 layer_input = temp_base + b * seq_len * hidden_size;
             }
 
-            // 当前层的输出指针
             float* layer_output;
             if (l == num_layers - 1) {
                 layer_output = batch_output;
@@ -79,21 +70,16 @@ __mlu_entry__ void multi_layer_gru_kernel(
                 layer_output = temp_base + b * seq_len * hidden_size;
             }
 
-            // 当前层的权重基地址
             const float* w_ih_layer = weight_ih + l * 3 * hidden_size * max_dim;
             const float* w_hh_layer = weight_hh + l * 3 * hidden_size * hidden_size;
             const float* bias_layer = bias + l * 3 * hidden_size;
 
-            // 初始化隐藏状态 h 为全 0
             __bang_write_zero(nram_h, aligned_hidden_size);
 
-            // 遍历序列
             for (int t = 0; t < seq_len; ++t) {
-                // 读取当前时间步的输入向量 x_t
                 const float* x_ptr = layer_input + t * in_dim;
                 __memcpy(nram_x, x_ptr, in_dim * sizeof(float), GDRAM2NRAM);
 
-                // 计算门向量 gate = W_ih * x + W_hh * h + bias
                 __bang_write_zero(nram_gate, 3 * aligned_hidden_size);
                 for (int i = 0; i < 3 * hidden_size; ++i) {
                     const float* w_ih_row = w_ih_layer + i * max_dim;
@@ -108,7 +94,6 @@ __mlu_entry__ void multi_layer_gru_kernel(
                     nram_gate[i] = sum;
                 }
 
-                // 拆分门向量
                 __memcpy(nram_z, nram_gate, hidden_size * sizeof(float), NRAM2NRAM);
                 __bang_active_sigmoid(nram_z, nram_z, aligned_hidden_size);
 
@@ -118,13 +103,11 @@ __mlu_entry__ void multi_layer_gru_kernel(
                 __memcpy(nram_n, nram_gate + 2 * hidden_size, hidden_size * sizeof(float), NRAM2NRAM);
                 __bang_active_tanh(nram_n, nram_n, aligned_hidden_size);
 
-                // 新隐藏状态 h_new = (1 - z) * h + z * n
                 __bang_sub_scalar(nram_tmp, nram_z, 1.0f, aligned_hidden_size);
                 __bang_mul(nram_tmp, nram_tmp, nram_h, aligned_hidden_size);
                 __bang_mul(nram_n, nram_z, nram_n, aligned_hidden_size);
                 __bang_add(nram_h, nram_tmp, nram_n, aligned_hidden_size);
 
-                // 写入输出
                 float* out_ptr = layer_output + t * hidden_size;
                 __memcpy(out_ptr, nram_h, hidden_size * sizeof(float), NRAM2GDRAM);
             }
@@ -132,15 +115,19 @@ __mlu_entry__ void multi_layer_gru_kernel(
     }
 }
 
-torch::Tensor bang_func(
+// 使用 extern "C" 和可见性属性确保符号正确导出
+extern "C" __attribute__((visibility("default"))) torch::Tensor bang_func(
     torch::Tensor input,
-    int hidden_size,
-    int num_layers,
+    torch::Tensor hidden_size_tensor,
+    torch::Tensor num_layers_tensor,
     torch::Tensor weight_ih,
     torch::Tensor weight_hh,
     torch::Tensor bias
 ) {
-    // 维度检查
+    // 从标量张量中提取整数参数
+    int hidden_size = hidden_size_tensor.item<int>();
+    int num_layers = num_layers_tensor.item<int>();
+
     TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
     TORCH_CHECK(weight_ih.is_contiguous(), "weight_ih must be contiguous");
     TORCH_CHECK(weight_hh.is_contiguous(), "weight_hh must be contiguous");
@@ -159,7 +146,6 @@ torch::Tensor bang_func(
     int input_size = sizes[2];
     int max_dim = std::max(input_size, hidden_size);
 
-    // 检查维度是否超出 MAX_DIM
     TORCH_CHECK(hidden_size <= MAX_DIM && input_size <= MAX_DIM,
                 "hidden_size and input_size must not exceed MAX_DIM (4096)");
 
