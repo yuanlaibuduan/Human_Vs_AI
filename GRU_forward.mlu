@@ -21,12 +21,9 @@ __mlu_entry__ void multi_layer_gru_kernel(
     int num_layers,
     int max_dim
 ) {
-    // 检查维度是否超出 NRAM 容量
     int aligned_input_size = ALIGN(input_size);
     int aligned_hidden_size = ALIGN(hidden_size);
-    if (aligned_input_size > MAX_DIM || aligned_hidden_size > MAX_DIM) {
-        return;
-    }
+    if (aligned_input_size > MAX_DIM || aligned_hidden_size > MAX_DIM) return;
 
     uint32_t core_id = taskId;
     uint32_t core_num = taskDim;
@@ -37,7 +34,6 @@ __mlu_entry__ void multi_layer_gru_kernel(
     int end_batch = start_batch + batch_per_core + (core_id < rem ? 1 : 0);
     if (start_batch >= end_batch) return;
 
-    // 固定大小的 NRAM 缓冲区
     __nram__ float nram_x[MAX_DIM];
     __nram__ float nram_h[MAX_DIM];
     __nram__ float nram_gate[3 * MAX_DIM];
@@ -52,7 +48,6 @@ __mlu_entry__ void multi_layer_gru_kernel(
 
         for (int l = 0; l < num_layers; ++l) {
             int in_dim = (l == 0) ? input_size : hidden_size;
-            int aligned_in_dim = ALIGN(in_dim);
 
             const float* layer_input;
             if (l == 0) {
@@ -84,13 +79,9 @@ __mlu_entry__ void multi_layer_gru_kernel(
                 for (int i = 0; i < 3 * hidden_size; ++i) {
                     const float* w_ih_row = w_ih_layer + i * max_dim;
                     float sum = bias_layer[i];
-                    for (int k = 0; k < in_dim; ++k) {
-                        sum += w_ih_row[k] * nram_x[k];
-                    }
+                    for (int k = 0; k < in_dim; ++k) sum += w_ih_row[k] * nram_x[k];
                     const float* w_hh_row = w_hh_layer + i * hidden_size;
-                    for (int k = 0; k < hidden_size; ++k) {
-                        sum += w_hh_row[k] * nram_h[k];
-                    }
+                    for (int k = 0; k < hidden_size; ++k) sum += w_hh_row[k] * nram_h[k];
                     nram_gate[i] = sum;
                 }
 
@@ -115,19 +106,14 @@ __mlu_entry__ void multi_layer_gru_kernel(
     }
 }
 
-// 使用 extern "C" 和可见性属性确保符号正确导出
-extern "C" __attribute__((visibility("default"))) torch::Tensor bang_func(
+torch::Tensor bang_func(
     torch::Tensor input,
-    torch::Tensor hidden_size_tensor,
-    torch::Tensor num_layers_tensor,
+    int hidden_size,
+    int num_layers,
     torch::Tensor weight_ih,
     torch::Tensor weight_hh,
     torch::Tensor bias
 ) {
-    // 从标量张量中提取整数参数
-    int hidden_size = hidden_size_tensor.item<int>();
-    int num_layers = num_layers_tensor.item<int>();
-
     TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
     TORCH_CHECK(weight_ih.is_contiguous(), "weight_ih must be contiguous");
     TORCH_CHECK(weight_hh.is_contiguous(), "weight_hh must be contiguous");
@@ -135,9 +121,7 @@ extern "C" __attribute__((visibility("default"))) torch::Tensor bang_func(
 
     auto original_dtype = input.scalar_type();
     torch::Tensor input_fp32 = input;
-    if (original_dtype != torch::kFloat) {
-        input_fp32 = input.to(torch::kFloat);
-    }
+    if (original_dtype != torch::kFloat) input_fp32 = input.to(torch::kFloat);
 
     auto sizes = input_fp32.sizes();
     TORCH_CHECK(sizes.size() == 3, "Input must be 3D [batch, seq_len, input_size]");
@@ -169,18 +153,16 @@ extern "C" __attribute__((visibility("default"))) torch::Tensor bang_func(
         weight_ih.data_ptr<float>(),
         weight_hh.data_ptr<float>(),
         bias.data_ptr<float>(),
-        batch,
-        seq_len,
-        input_size,
-        hidden_size,
-        num_layers,
-        max_dim
+        batch, seq_len, input_size, hidden_size, num_layers, max_dim
     );
 
     cnrtQueueSync(queue);
 
-    if (original_dtype != torch::kFloat) {
-        return output_fp32.to(original_dtype);
-    }
+    if (original_dtype != torch::kFloat) return output_fp32.to(original_dtype);
     return output_fp32;
+}
+
+// 显式绑定，确保符号正确导出
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("bang_func", &bang_func, "Multi-layer GRU forward (BangC)");
 }
