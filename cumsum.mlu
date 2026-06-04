@@ -5,42 +5,40 @@
 #define CHUNK_SIZE 1024
 
 __mlu_entry__ void cumsum_kernel(
-    float* in,
-    float* out,
-    int64_t outer_size,
+    const float* src,
+    float* dst,
+    int64_t outer,
     int64_t dim_len,
-    int64_t inner_size
+    int64_t inner
 ) {
     uint32_t core_id = taskId;
     uint32_t core_num = taskDim;
 
-    int64_t per_core = outer_size / core_num;
-    int64_t rem = outer_size % core_num;
-    int64_t start = core_id * per_core + (core_id < rem ? core_id : rem);
-    int64_t count = per_core + (core_id < rem ? 1 : 0);
+    int64_t task_per_core = outer / core_num;
+    int64_t rem = outer % core_num;
+    int64_t beg = core_id * task_per_core + (core_id < rem ? core_id : rem);
+    int64_t end = beg + task_per_core + (core_id < rem ? 1 : 0);
 
     __nram__ float n_in[CHUNK_SIZE];
     __nram__ float n_acc[CHUNK_SIZE];
     __nram__ float n_out[CHUNK_SIZE];
 
-    for (int64_t o = start; o < start + count; o++) {
-        for (int64_t ib = 0; ib < inner_size; ib += CHUNK_SIZE) {
-            int64_t ci = inner_size - ib;
-            ci = ci > CHUNK_SIZE ? CHUNK_SIZE : ci;
-            int64_t alen = (ci + 63) & ~63;
+    for (int64_t o = beg; o < end; ++o) {
+        for (int64_t ib = 0; ib < inner; ib += CHUNK_SIZE) {
+            int64_t cur_inner = inner - ib;
+            cur_inner = cur_inner > CHUNK_SIZE ? CHUNK_SIZE : cur_inner;
+            int64_t align_len = (cur_inner + 63) & ~63;
 
-            // 手动清零，兼容所有环境
-            for (int i = 0; i < alen; i++) {
+            for (int i = 0; i < align_len; ++i)
                 n_acc[i] = 0.0f;
-            }
 
-            for (int64_t d = 0; d < dim_len; d++) {
-                int64_t gaddr = o * dim_len * inner_size + d * inner_size + ib;
+            for (int64_t d = 0; d < dim_len; ++d) {
+                int64_t g_off = o * dim_len * inner + d * inner + ib;
 
-                __memcpy(n_in, in + gaddr, ci * sizeof(float), GDRAM2NRAM);
-                __bang_add(n_out, n_acc, n_in, alen);
-                __bang_move(n_acc, n_out, alen);
-                __memcpy(out + gaddr, n_out, ci * sizeof(float), NRAM2GDRAM);
+                __memcpy(n_in, src + g_off, cur_inner * sizeof(float), GDRAM2NRAM);
+                __bang_add(n_out, n_acc, n_in, align_len);
+                __bang_move(n_acc, n_out, align_len);
+                __memcpy(dst + g_off, n_out, cur_inner * sizeof(float), NRAM2GDRAM);
             }
         }
     }
@@ -48,14 +46,12 @@ __mlu_entry__ void cumsum_kernel(
 
 torch::Tensor bang_func(torch::Tensor x, int dim) {
     TORCH_CHECK(x.is_contiguous(), "input must be contiguous");
-    auto dtype = x.scalar_type();
-
-    torch::Tensor x_fp32 = x.to(torch::kFloat);
-    torch::Tensor out_fp32 = torch::empty_like(x_fp32);
-
-    auto sizes = x_fp32.sizes();
+    auto sizes = x.sizes();
     int ndim = sizes.size();
     if (dim < 0) dim += ndim;
+
+    torch::Tensor x_fp32 = x.to(torch::kFloat);
+    torch::Tensor out = torch::empty_like(x_fp32);
 
     int64_t outer = 1;
     for (int i = 0; i < dim; i++) outer *= sizes[i];
@@ -69,9 +65,9 @@ torch::Tensor bang_func(torch::Tensor x, int dim) {
 
     cumsum_kernel<<<grid, ktype, q>>>(
         x_fp32.data_ptr<float>(),
-        out_fp32.data_ptr<float>(),
+        out.data_ptr<float>(),
         outer, dim_l, inner
     );
 
-    return out_fp32.to(dtype);
+    return out.to(x.scalar_type());
 }
