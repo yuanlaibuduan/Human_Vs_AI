@@ -3,124 +3,156 @@
 #include <cnrt.h>
 #include <vector>
 
-// 核函数：对每个独立序列执行前缀和累加
-// input: 输入张量 (float)
-// output: 输出张量 (float)
-// offsets: 每个序列首元素相对于张量起始的偏移量（元素个数）
-// dim_size: 序列长度（指定维度的长度）
-// stride_dim: 沿指定维度的步长（元素个数）
+#define BLOCK_SIZE 4096   // NRAM 块大小（元素个数）
+
+// 核函数：使用 NRAM 缓存，对每个序列执行前缀和
+// input, output: 设备端指针
+// offsets: 每个序列首元素的线性索引（int）
+// dim_size: 序列长度
+// stride_dim: 沿 dim 维度的步长（元素个数）
 // num_seqs: 序列总数
 __mlu_entry__ void cumsum_kernel(float* input,
                                  float* output,
-                                 const int64_t* offsets,
+                                 const int* offsets,
                                  int dim_size,
-                                 int64_t stride_dim,
+                                 int stride_dim,
                                  int num_seqs) {
+    __nram__ float nram_in[BLOCK_SIZE];
+    __nram__ float nram_out[BLOCK_SIZE];
+
     uint32_t core_id = taskId;
     uint32_t core_num = taskDim;
-
-    // 每个核处理的序列数量
     int seqs_per_core = (num_seqs + core_num - 1) / core_num;
     int start_seq = core_id * seqs_per_core;
     int end_seq = start_seq + seqs_per_core;
     if (end_seq > num_seqs) end_seq = num_seqs;
 
-    // 处理分配给当前核的序列
     for (int seq = start_seq; seq < end_seq; ++seq) {
-        int64_t base = offsets[seq];
+        int base = offsets[seq];
         float prefix = 0.0f;
-        for (int i = 0; i < dim_size; ++i) {
-            int64_t idx = base + i * stride_dim;
-            prefix += input[idx];
-            output[idx] = prefix;
+
+        // 按块处理序列
+        for (int block_start = 0; block_start < dim_size; block_start += BLOCK_SIZE) {
+            int len = dim_size - block_start;
+            if (len > BLOCK_SIZE) len = BLOCK_SIZE;
+
+            // 从 GDRAM 加载数据到 NRAM
+            int64_t src_addr = base + block_start * stride_dim;
+            __memcpy(nram_in, input + src_addr, len * sizeof(float), GDRAM2NRAM);
+
+            // 在 NRAM 内执行前缀和（标量循环，但访存已优化）
+            float running = prefix;
+            for (int i = 0; i < len; ++i) {
+                running += nram_in[i];
+                nram_out[i] = running;
+            }
+            prefix = running;  // 保存块末尾的累加值，用于下一个块
+
+            // 写回结果到 GDRAM
+            __memcpy(output + src_addr, nram_out, len * sizeof(float), NRAM2GDRAM);
         }
     }
 }
 
-// 主机端封装函数，供 PyTorch 调用
+// 主机端函数：计算每个序列的起始线性索引
+static std::vector<int> compute_offsets(const torch::Tensor& t, int dim) {
+    int ndim = t.dim();
+    std::vector<int64_t> shape = t.sizes();
+    std::vector<int64_t> strides = t.strides();
+
+    // 收集除 dim 以外的维度索引
+    std::vector<int> other_dims;
+    for (int d = 0; d < ndim; ++d) {
+        if (d != dim) other_dims.push_back(d);
+    }
+    int other_rank = other_dims.size();
+
+    // 如果 only dim, 则只有一个序列
+    if (other_rank == 0) {
+        return std::vector<int>(1, 0);
+    }
+
+    // 计算每个 other 维度的长度和步长
+    std::vector<int64_t> other_shape(other_rank);
+    std::vector<int64_t> other_stride(other_rank);
+    for (int i = 0; i < other_rank; ++i) {
+        other_shape[i] = shape[other_dims[i]];
+        other_stride[i] = strides[other_dims[i]];
+    }
+
+    // 计算总的序列数量
+    int64_t num_seqs = 1;
+    for (auto s : other_shape) num_seqs *= s;
+
+    // 构建每个序列的线性偏移
+    std::vector<int> offsets(num_seqs);
+    std::vector<int64_t> indices(other_rank, 0);
+
+    for (int64_t seq = 0; seq < num_seqs; ++seq) {
+        int64_t offset = 0;
+        for (int i = 0; i < other_rank; ++i) {
+            offset += indices[i] * other_stride[i];
+        }
+        offsets[seq] = static_cast<int>(offset);  // 线性索引，假设小于 2^31
+
+        // 更新 indices (多进制加法)
+        for (int i = other_rank - 1; i >= 0; --i) {
+            if (++indices[i] < other_shape[i]) break;
+            indices[i] = 0;
+        }
+    }
+    return offsets;
+}
+
+// PyTorch 入口函数
 torch::Tensor bang_func(torch::Tensor x, int dim) {
-    // 维度归一化与合法性检查
     int ndim = x.dim();
     if (dim < 0) dim += ndim;
     TORCH_CHECK(dim >= 0 && dim < ndim, "Invalid dim");
 
-    // 确保输入连续
     x = x.contiguous();
-
-    // 转换为 float32 进行计算
     torch::Tensor input_fp32 = x;
     auto original_dtype = x.scalar_type();
     if (original_dtype != torch::kFloat) {
         input_fp32 = x.to(torch::kFloat);
     }
 
-    // 输出张量
-    torch::Tensor output_fp32 = torch::empty_like(input_fp32);
+    auto output_fp32 = torch::empty_like(input_fp32);
 
-    // 获取形状、步长等信息
-    auto shape = input_fp32.sizes();
-    auto strides = input_fp32.strides();
-    int64_t dim_size = shape[dim];
-    int64_t stride_dim = strides[dim];
+    // 获取基本信息
+    int64_t dim_size = input_fp32.size(dim);
+    int64_t stride_dim = input_fp32.stride(dim);
     int64_t total_elements = input_fp32.numel();
-    int64_t num_seqs = total_elements / dim_size;  // 序列总数
+    int64_t num_seqs = total_elements / dim_size;
 
-    // ---------- 计算每个序列首元素的偏移量 ----------
-    std::vector<int64_t> host_offsets(num_seqs);
-    // 收集除 dim 以外的维度信息
-    std::vector<int64_t> other_dims;
-    std::vector<int64_t> other_strides;
-    for (int d = 0; d < ndim; ++d) {
-        if (d == dim) continue;
-        other_dims.push_back(shape[d]);
-        other_strides.push_back(strides[d]);
-    }
-    int other_rank = other_dims.size();
+    // 计算每个序列的起始偏移量（32位整数）
+    std::vector<int> host_offsets = compute_offsets(input_fp32, dim);
+    TORCH_CHECK(host_offsets.size() == static_cast<size_t>(num_seqs), "Offset count mismatch");
 
-    // 计算每个 other 维度的累乘因子，用于线性索引分解
-    std::vector<int64_t> mult(other_rank, 1);
-    for (int i = other_rank - 1; i > 0; --i) {
-        mult[i-1] = mult[i] * other_dims[i];
-    }
-
-    // 为每个序列计算偏移量
-    for (int64_t seq = 0; seq < num_seqs; ++seq) {
-        int64_t tmp = seq;
-        int64_t offset = 0;
-        for (int d = 0; d < other_rank; ++d) {
-            int64_t idx = tmp / mult[d];
-            tmp %= mult[d];
-            offset += idx * other_strides[d];
-        }
-        host_offsets[seq] = offset;
-    }
-
-    // 将偏移量数组拷贝到设备端
-    int64_t* dev_offsets = nullptr;
-    size_t offsets_bytes = num_seqs * sizeof(int64_t);
+    // 拷贝偏移量到设备
+    int* dev_offsets = nullptr;
+    size_t offsets_bytes = num_seqs * sizeof(int);
     cnrtMalloc((void**)&dev_offsets, offsets_bytes);
     cnrtMemcpy(dev_offsets, host_offsets.data(), offsets_bytes, CNRT_MEM_TRANS_DIR_HOST2DEV);
 
-    // 获取当前 MLU 队列
+    // 获取 MLU 队列
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
-    // 启动核函数（使用 Union1 类型，256 个核）
-    cnrtDim3_t dim3 = {256, 1, 1};
+    // 启动核函数：使用 1024 个核，Union1 类型
+    cnrtDim3_t dim3 = {1024, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
     cumsum_kernel<<<dim3, ktype, queue>>>(
         input_fp32.data_ptr<float>(),
         output_fp32.data_ptr<float>(),
         dev_offsets,
-        dim_size,
-        stride_dim,
-        num_seqs
+        static_cast<int>(dim_size),
+        static_cast<int>(stride_dim),
+        static_cast<int>(num_seqs)
     );
 
-    // 释放设备端偏移数组
     cnrtFree(dev_offsets);
 
-    // 将结果转回原始数据类型
     if (original_dtype != torch::kFloat) {
         return output_fp32.to(original_dtype);
     }
