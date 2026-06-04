@@ -1,59 +1,47 @@
 // 051_cumsum.mlu
-// 沿指定维度计算累加前缀和（Cumulative Sum）
-// 策略：将目标维度置换到最后一维，使每个切片在内存中连续；每个核心处理一个或多个完整切片，
-//       通过批量传输将整个切片读入 NRAM，串行累加后写回，充分利用内存带宽和向量化指令。
+// 使用 __bang_cycle_add 实现高效前缀和
 
 #include <bang.h>
 #include <cnrt.h>
 #include <torch/extension.h>
 #include <vector>
 
-#define MAX_SLICE_LEN 20000  // 单个切片最大长度（不超过 NRAM 容量）
-#define CORE_NUM 16          // 使用的计算核心数量（可根据硬件调整）
+#define MAX_SLICE_LEN 8192  // 足够覆盖输入维度（4000）
+#define CORE_NUM 16          // 使用 16 个核心并行处理切片
 
-// 核函数：对每个独立切片执行 inclusive prefix sum
-// 参数：
-//   input      – 输入张量指针 (float32)
-//   output     – 输出张量指针 (float32)
-//   slice_len  – 每个切片的长度（目标维度大小）
-//   slice_count – 切片总数
+// 核函数：对每个切片调用 __bang_cycle_add 计算前缀和
 __mlu_entry__ void cumsum_kernel(float* input, float* output,
                                  int slice_len, int slice_count) {
     uint32_t core_id = taskId;
     uint32_t core_num = taskDim;
 
-    // 将切片均匀分配给各个核心
+    // 将切片均匀分配给各核心
     int slices_per_core = (slice_count + core_num - 1) / core_num;
     int start_slice = core_id * slices_per_core;
     int end_slice = start_slice + slices_per_core;
     if (end_slice > slice_count) end_slice = slice_count;
 
-    // NRAM 缓冲区，足以容纳一个完整切片
-    __nram__ float nram_data[MAX_SLICE_LEN];
+    // NRAM 缓冲区，大小固定为最大切片长度
+    __nram__ float nram_buf[MAX_SLICE_LEN];
 
     for (int s = start_slice; s < end_slice; ++s) {
         float* in_ptr  = input  + s * slice_len;
         float* out_ptr = output + s * slice_len;
 
-        // 将整个切片从 GDRAM 读入 NRAM（批量传输）
-        __memcpy(nram_data, in_ptr, slice_len * sizeof(float), GDRAM2NRAM);
+        // 将切片从 GDRAM 加载到 NRAM
+        __memcpy(nram_buf, in_ptr, slice_len * sizeof(float), GDRAM2NRAM);
 
-        // 在 NRAM 内部执行串行前缀和（编译器自动向量化并展开循环）
-        float acc = 0.0f;
-        #pragma unroll 4  // 提示编译器展开循环
-        for (int i = 0; i < slice_len; ++i) {
-            acc += nram_data[i];
-            nram_data[i] = acc;
-        }
+        // 硬件加速前缀和：每 1 个元素循环累加 => inclusive prefix sum
+        __bang_cycle_add(nram_buf, nram_buf, slice_len, 1);
 
         // 将结果写回 GDRAM
-        __memcpy(out_ptr, nram_data, slice_len * sizeof(float), NRAM2GDRAM);
+        __memcpy(out_ptr, nram_buf, slice_len * sizeof(float), NRAM2GDRAM);
     }
 }
 
-// 外部包装函数：处理维度置换、数据类型转换，并启动核函数
+// 外部封装函数
 torch::Tensor bang_func(torch::Tensor x, int dim) {
-    // 确保输入连续
+    // 确保输入连续，处理负数 dim
     x = x.contiguous();
     int64_t ndim = x.dim();
     if (dim < 0) dim += ndim;
@@ -61,7 +49,7 @@ torch::Tensor bang_func(torch::Tensor x, int dim) {
 
     auto original_dtype = x.scalar_type();
 
-    // 将目标维度置换到最后一维，使切片在内存中连续
+    // 将目标维度置换到最后一维，使切片内存连续
     bool need_permute = (dim != ndim - 1);
     std::vector<int64_t> perm;
     if (need_permute) {
@@ -78,14 +66,13 @@ torch::Tensor bang_func(torch::Tensor x, int dim) {
 
     int64_t slice_len = x_fp32.size(-1);
     int64_t slice_count = x_fp32.numel() / slice_len;
-    TORCH_CHECK(slice_len <= MAX_SLICE_LEN, "Slice length exceeds MAX_SLICE_LEN, please increase the macro.");
+    TORCH_CHECK(slice_len <= MAX_SLICE_LEN,
+                "Slice length exceeds MAX_SLICE_LEN, please increase the macro.");
 
     auto output_fp32 = torch::empty_like(x_fp32);
 
     // 获取当前 MLU 流队列
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-
-    // 启动核函数：使用 CORE_NUM 个核心，均匀分配切片
     cnrtDim3_t dim_grid = {CORE_NUM, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
