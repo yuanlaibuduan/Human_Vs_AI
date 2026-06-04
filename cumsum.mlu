@@ -2,80 +2,76 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
-#define CHUNK_SIZE 2048
+#define CHUNK_SIZE 1024
 
 __mlu_entry__ void cumsum_kernel(
-    float* in_gdram,
-    float* out_gdram,
+    float* in,
+    float* out,
     int64_t outer_size,
     int64_t dim_len,
     int64_t inner_size
 ) {
-    uint32_t core_idx = taskId;
-    uint32_t core_cnt = taskDim;
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
 
-    int64_t per_core = outer_size / core_cnt;
-    int64_t rem = outer_size % core_cnt;
-    int64_t core_start = core_idx * per_core + (core_idx < rem ? core_idx : rem);
-    int64_t core_elem = per_core + (core_idx < rem ? 1 : 0);
+    int64_t per_core = outer_size / core_num;
+    int64_t rem = outer_size % core_num;
+    int64_t start = core_id * per_core + (core_id < rem ? core_id : rem);
+    int64_t count = per_core + (core_id < rem ? 1 : 0);
 
-    __nram__ float nram_in[CHUNK_SIZE];
-    __nram__ float nram_acc[CHUNK_SIZE];
-    __nram__ float nram_out[CHUNK_SIZE];
+    __nram__ float n_in[CHUNK_SIZE];
+    __nram__ float n_acc[CHUNK_SIZE];
+    __nram__ float n_out[CHUNK_SIZE];
 
-    for (int64_t outer = core_start; outer < core_start + core_elem; outer++) {
-        for (int64_t inner_base = 0; inner_base < inner_size; inner_base += CHUNK_SIZE) {
-            int64_t inner_rem = inner_size - inner_base;
-            int64_t cur_inner = inner_rem > CHUNK_SIZE ? CHUNK_SIZE : inner_rem;
-            int64_t align_len = (cur_inner + 63) & ~63;
+    for (int64_t o = start; o < start + count; o++) {
+        for (int64_t ib = 0; ib < inner_size; ib += CHUNK_SIZE) {
+            int64_t ci = inner_size - ib;
+            ci = ci > CHUNK_SIZE ? CHUNK_SIZE : ci;
+            int64_t alen = (ci + 63) & ~63;
 
-            // 手动循环清零，替代 __bang_zero，解决编译错误
-            for (int i = 0; i < align_len; i++) {
-                nram_acc[i] = 0.0f;
+            // 手动清零，兼容所有环境
+            for (int i = 0; i < alen; i++) {
+                n_acc[i] = 0.0f;
             }
 
             for (int64_t d = 0; d < dim_len; d++) {
-                int64_t gdram_off = outer * dim_len * inner_size + d * inner_size + inner_base;
+                int64_t gaddr = o * dim_len * inner_size + d * inner_size + ib;
 
-                __memcpy(nram_in, in_gdram + gdram_off, cur_inner * sizeof(float), GDRAM2NRAM);
-                __bang_add(nram_out, nram_acc, nram_in, align_len);
-                __bang_move(nram_acc, nram_out, align_len);
-                __memcpy(out_gdram + gdram_off, nram_out, cur_inner * sizeof(float), NRAM2GDRAM);
+                __memcpy(n_in, in + gaddr, ci * sizeof(float), GDRAM2NRAM);
+                __bang_add(n_out, n_acc, n_in, alen);
+                __bang_move(n_acc, n_out, alen);
+                __memcpy(out + gaddr, n_out, ci * sizeof(float), NRAM2GDRAM);
             }
         }
     }
 }
 
 torch::Tensor bang_func(torch::Tensor x, int dim) {
-    TORCH_CHECK(x.is_contiguous(), "input tensor must be contiguous");
-    auto origin_dtype = x.scalar_type();
+    TORCH_CHECK(x.is_contiguous(), "input must be contiguous");
+    auto dtype = x.scalar_type();
 
-    torch::Tensor x_fp32 = (origin_dtype == torch::kFloat) ? x : x.to(torch::kFloat);
-    auto out_fp32 = torch::empty_like(x_fp32);
+    torch::Tensor x_fp32 = x.to(torch::kFloat);
+    torch::Tensor out_fp32 = torch::empty_like(x_fp32);
 
-    auto shape = x_fp32.sizes();
-    int ndim = shape.size();
+    auto sizes = x_fp32.sizes();
+    int ndim = sizes.size();
     if (dim < 0) dim += ndim;
 
     int64_t outer = 1;
-    for (int i = 0; i < dim; i++) outer *= shape[i];
-    int64_t dim_len = shape[dim];
+    for (int i = 0; i < dim; i++) outer *= sizes[i];
+    int64_t dim_l = sizes[dim];
     int64_t inner = 1;
-    for (int i = dim + 1; i < ndim; i++) inner *= shape[i];
+    for (int i = dim + 1; i < ndim; i++) inner *= sizes[i];
 
     cnrtQueue_t q = torch_mlu::getCurMLUStream();
-    cnrtDim3_t grid = {8, 1, 1};
-    cnrtFunctionType_t func_type = cnrtFuncTypeUnion1;
+    cnrtDim3_t grid = {16, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
-    cumsum_kernel<<<grid, func_type, q>>>(
+    cumsum_kernel<<<grid, ktype, q>>>(
         x_fp32.data_ptr<float>(),
         out_fp32.data_ptr<float>(),
-        outer,
-        dim_len,
-        inner
+        outer, dim_l, inner
     );
 
-    if (origin_dtype != torch::kFloat)
-        return out_fp32.to(origin_dtype);
-    return out_fp32;
+    return out_fp32.to(dtype);
 }

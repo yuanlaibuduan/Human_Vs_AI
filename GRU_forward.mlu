@@ -1,9 +1,9 @@
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
+#include <math.h>
 
 #define CHUNK_SIZE 1024
-#define ALIGN64 64
 
 __mlu_entry__ void gru_layer_kernel(
     float *g_in_seq,
@@ -12,12 +12,11 @@ __mlu_entry__ void gru_layer_kernel(
     float *g_w_hh,
     float *g_b_ih,
     float *g_b_hh,
-    int B,    // batch
-    int T,    // seq_len
-    int I,    // input_size
-    int H     // hidden_size
-)
-{
+    int B,
+    int T,
+    int I,
+    int H
+) {
     uint32_t core = taskId;
     uint32_t ncore = taskDim;
 
@@ -28,79 +27,68 @@ __mlu_entry__ void gru_layer_kernel(
 
     __nram__ float nx[CHUNK_SIZE];
     __nram__ float h_prev[CHUNK_SIZE];
-    __nram__ float z[CHUNK_SIZE], r[CHUNK_SIZE], n[CHUNK_SIZE];
-    __nram__ float tmp0[CHUNK_SIZE], tmp1[CHUNK_SIZE];
-    __nram__ float tmp2[CHUNK_SIZE], tmp3[CHUNK_SIZE];
+    __nram__ float tmp0[CHUNK_SIZE];
+    __nram__ float tmp1[CHUNK_SIZE];
+    __nram__ float tmp2[CHUNK_SIZE];
 
     int G3 = 3 * H;
 
     for (int b = 0; b < cnt; b++) {
         int curB = st + b;
 
-        // h0 = 0 (手动循环赋值，无__bang_set_constant)
-        for (int i = 0; i < H; i++) h_prev[i] = 0.0f;
+        // h0 = 0
+        for (int i = 0; i < H; i++)
+            h_prev[i] = 0.0f;
 
         for (int t = 0; t < T; t++) {
             // 加载 x_t
             int x_off = curB * T * I + t * I;
             __memcpy(nx, g_in_seq + x_off, I * 4, GDRAM2NRAM);
 
-            // ==========================
-            // 手动计算 W_ih @ x + b_ih
-            // ==========================
+            // W_ih @ x + b_ih
             for (int g = 0; g < G3; g++) {
-                float sum = g_b_ih[g];
-                for (int i = 0; i < I; i++) {
-                    sum += g_w_ih[g * I + i] * nx[i];
-                }
-                tmp0[g] = sum;
+                float s = g_b_ih[g];
+                for (int i = 0; i < I; i++)
+                    s += g_w_ih[g * I + i] * nx[i];
+                tmp0[g] = s;
             }
 
-            // ==========================
-            // 手动计算 W_hh @ h_prev + b_hh
-            // ==========================
+            // W_hh @ h_prev + b_hh
             for (int g = 0; g < G3; g++) {
-                float sum = g_b_hh[g];
-                for (int k = 0; k < H; k++) {
-                    sum += g_w_hh[g * H + k] * h_prev[k];
-                }
-                tmp1[g] = sum;
+                float s = g_b_hh[g];
+                for (int k = 0; k < H; k++)
+                    s += g_w_hh[g * H + k] * h_prev[k];
+                tmp1[g] = s;
             }
 
-            // z = sigmoid( z_x + z_h )
+            // 计算 z, r, n（纯 C 标准数学函数）
             for (int k = 0; k < H; k++) {
+                // z = sigmoid
                 float v = tmp0[k] + tmp1[k];
-                z[k] = 1.0f / (1.0f + __bang_exp(-v));
-            }
+                float ez = expf(-v);
+                float z = 1.0f / (1.0f + ez);
 
-            // r = sigmoid( r_x + r_h )
-            for (int k = 0; k < H; k++) {
-                float v = tmp0[H + k] + tmp1[H + k];
-                r[k] = 1.0f / (1.0f + __bang_exp(-v));
-            }
+                // r = sigmoid
+                v = tmp0[H + k] + tmp1[H + k];
+                float er = expf(-v);
+                float r = 1.0f / (1.0f + er);
 
-            // n = tanh( n_x + r * n_h )
-            for (int k = 0; k < H; k++) {
-                float rh = r[k] * tmp1[2 * H + k];
-                float v = tmp0[2 * H + k] + rh;
-                n[k] = __bang_tanh(v);
-            }
+                // n = tanh
+                v = tmp0[2*H + k] + r * tmp1[2*H + k];
+                float n = tanhf(v);
 
-            // h_t = (1 - z) * n + z * h_prev
-            for (int k = 0; k < H; k++) {
-                float one_z = 1.0f - z[k];
-                float val = one_z * n[k] + z[k] * h_prev[k];
-                tmp2[k] = val;
+                // h_t = (1-z)*n + z*h_prev
+                float h_cur = (1.0f - z) * n + z * h_prev[k];
+                tmp2[k] = h_cur;
             }
 
             // 写回输出
             int out_off = curB * T * H + t * H;
             __memcpy(g_out_seq + out_off, tmp2, H * 4, NRAM2GDRAM);
 
-            // 更新 h_prev（手动循环，无__bang_copy）
-            for (int k = 0; k < H; k++) {
+            // 更新 h_prev
+            for (int k = 0; k < H; k++)
                 h_prev[k] = tmp2[k];
-            }
         }
     }
 }
