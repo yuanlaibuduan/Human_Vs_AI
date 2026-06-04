@@ -1,47 +1,49 @@
 // 051_cumsum.mlu
-// 使用 __bang_cycle_add 实现高效前缀和
-
+// 高效前缀和（Cumulative Sum）算子
+// 策略：将目标维度置换到最后一维，每个核处理一个或多个完整切片；
+//       在 NRAM 中使用 __bang_cycle_add 进行硬件加速前缀和。
 #include <bang.h>
 #include <cnrt.h>
 #include <torch/extension.h>
 #include <vector>
 
-#define MAX_SLICE_LEN 8192  // 足够覆盖输入维度（4000）
-#define CORE_NUM 16          // 使用 16 个核心并行处理切片
+#define MAX_SLICE_LEN 8192   // 最大切片长度（4000 以内，留有余量）
+#define CORE_NUM       16    // 使用的计算核心数（MLU 典型值）
 
-// 核函数：对每个切片调用 __bang_cycle_add 计算前缀和
+// 核函数：对每个切片执行 inclusive prefix sum
 __mlu_entry__ void cumsum_kernel(float* input, float* output,
                                  int slice_len, int slice_count) {
     uint32_t core_id = taskId;
     uint32_t core_num = taskDim;
 
-    // 将切片均匀分配给各核心
+    // 将切片均匀分配给各个核心
     int slices_per_core = (slice_count + core_num - 1) / core_num;
     int start_slice = core_id * slices_per_core;
     int end_slice = start_slice + slices_per_core;
     if (end_slice > slice_count) end_slice = slice_count;
 
-    // NRAM 缓冲区，大小固定为最大切片长度
-    __nram__ float nram_buf[MAX_SLICE_LEN];
+    // NRAM 缓冲区：足以容纳一个完整切片
+    __nram__ float nram_data[MAX_SLICE_LEN];
 
     for (int s = start_slice; s < end_slice; ++s) {
         float* in_ptr  = input  + s * slice_len;
         float* out_ptr = output + s * slice_len;
 
-        // 将切片从 GDRAM 加载到 NRAM
-        __memcpy(nram_buf, in_ptr, slice_len * sizeof(float), GDRAM2NRAM);
+        // 从 GDRAM 加载整个切片到 NRAM（批量传输）
+        __memcpy(nram_data, in_ptr, slice_len * sizeof(float), GDRAM2NRAM);
 
-        // 硬件加速前缀和：每 1 个元素循环累加 => inclusive prefix sum
-        __bang_cycle_add(nram_buf, nram_buf, slice_len, 1);
+        // 使用硬件加速指令计算前缀和
+        // __bang_cycle_add 当 cycle_len = 1 时，执行 inclusive prefix sum
+        __bang_cycle_add(nram_data, nram_data, slice_len, 1);
 
         // 将结果写回 GDRAM
-        __memcpy(out_ptr, nram_buf, slice_len * sizeof(float), NRAM2GDRAM);
+        __memcpy(out_ptr, nram_data, slice_len * sizeof(float), NRAM2GDRAM);
     }
 }
 
 // 外部封装函数
 torch::Tensor bang_func(torch::Tensor x, int dim) {
-    // 确保输入连续，处理负数 dim
+    // 确保输入连续，处理负数维度
     x = x.contiguous();
     int64_t ndim = x.dim();
     if (dim < 0) dim += ndim;
