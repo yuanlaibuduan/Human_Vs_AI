@@ -161,8 +161,3 @@ torch::Tensor bang_func(
     if (original_dtype != torch::kFloat) return output_fp32.to(original_dtype);
     return output_fp32;
 }
-
-// 显式绑定，确保符号正确导出
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("bang_func", &bang_func, "Multi-layer GRU forward (BangC)");
-}
