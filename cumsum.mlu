@@ -21,32 +21,36 @@ __mlu_entry__ void cumsum_kernel(
     int64_t core_start = core_idx * per_core + (core_idx < rem ? core_idx : rem);
     int64_t core_elem = per_core + (core_idx < rem ? 1 : 0);
 
-    __nram__ float nram_buf[CHUNK_SIZE];
+    // NRAM 必须全部用 __nram__ 声明
+    __nram__ float nram_in[CHUNK_SIZE];
+    __nram__ float nram_acc[CHUNK_SIZE];
+    __nram__ float nram_out[CHUNK_SIZE];
 
     // 遍历当前core负责的outer分片
     for(int64_t outer = core_start; outer < core_start + core_elem; outer++){
-        // 每个outer下，沿dim维度做前缀和，inner为并行小粒度
         for(int64_t inner_base = 0; inner_base < inner_size; inner_base += CHUNK_SIZE){
             int64_t inner_rem = inner_size - inner_base;
             int64_t cur_inner = inner_rem > CHUNK_SIZE ? CHUNK_SIZE : inner_rem;
             int64_t align_len = (cur_inner + 63) & ~63;
 
-            float pre_sum[CHUNK_SIZE] = {0.0f};
+            // 累加器清零（必须放在NRAM）
+            __bang_zero(nram_acc, align_len);
 
             // 逐次沿dim方向累加，前缀和
             for(int64_t d = 0; d < dim_len; d++){
-                // 计算当前数据在GDRAM偏移：outer*dim_len*inner + d*inner + inner_base
                 int64_t gdram_off = outer * dim_len * inner_size + d * inner_size + inner_base;
-                // 载入当前段数据
-                __memcpy(nram_buf, in_gdram + gdram_off, cur_inner * sizeof(float), GDRAM2NRAM);
 
-                // pre_sum += nram_buf，得到当前位置前缀和
-                __bang_add(nram_buf, nram_buf, pre_sum, align_len);
-                // 更新累加缓存pre_sum
-                __bang_copy(pre_sum, nram_buf, align_len);
+                // 读入当前数据
+                __memcpy(nram_in, in_gdram + gdram_off, cur_inner * sizeof(float), GDRAM2NRAM);
 
-                // 结果写回输出
-                __memcpy(out_gdram + gdram_off, nram_buf, cur_inner * sizeof(float), NRAM2GDRAM);
+                // acc = acc + in
+                __bang_add(nram_out, nram_acc, nram_in, align_len);
+
+                // 更新累加器
+                __bang_move(nram_acc, nram_out, align_len);
+
+                // 写回结果
+                __memcpy(out_gdram + gdram_off, nram_out, cur_inner * sizeof(float), NRAM2GDRAM);
             }
         }
     }
@@ -57,28 +61,27 @@ torch::Tensor bang_func(torch::Tensor x, int dim) {
     TORCH_CHECK(x.is_contiguous(), "input tensor must be contiguous");
     auto origin_dtype = x.scalar_type();
 
-    // 统一转fp32做内部计算
+    // 统一转fp32
     torch::Tensor x_fp32 = (origin_dtype == torch::kFloat) ? x : x.to(torch::kFloat);
     auto out_fp32 = torch::empty_like(x_fp32);
 
     auto shape = x_fp32.sizes();
     int ndim = shape.size();
-    // 处理负数dim
     if(dim < 0) dim += ndim;
 
-    // 拆分三个关键参数：outer、dim_len、inner
+    // 计算维度拆分参数
     int64_t outer = 1;
     for(int i = 0; i < dim; i++) outer *= shape[i];
     int64_t dim_len = shape[dim];
     int64_t inner = 1;
     for(int i = dim + 1; i < ndim; i++) inner *= shape[i];
 
-    // 获取MLU当前流
+    // MLU 流
     cnrtQueue_t q = torch_mlu::getCurMLUStream();
     cnrtDim3_t grid = {8, 1, 1};
     cnrtFunctionType_t func_type = cnrtFuncTypeUnion1;
 
-    // 启动kernel
+    // 启动核函数
     cumsum_kernel<<<grid, func_type, q>>>(
         x_fp32.data_ptr<float>(),
         out_fp32.data_ptr<float>(),
@@ -87,7 +90,8 @@ torch::Tensor bang_func(torch::Tensor x, int dim) {
         inner
     );
 
-    // 还原原始数据类型
-    if(origin_dtype != torch::kFloat) return out_fp32.to(origin_dtype);
+    // 恢复类型
+    if(origin_dtype != torch::kFloat)
+        return out_fp32.to(origin_dtype);
     return out_fp32;
 }
