@@ -6,7 +6,6 @@
 #include <bang.h>
 #include <cnrt.h>
 #include <torch/extension.h>
-#include <torch_mlu.h>
 
 // -----------------------------------------------------------------------------
 // Kernel: each thread computes one output element
@@ -107,10 +106,10 @@ torch::Tensor bang_func(torch::Tensor x,
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
 
-    // Obtain current MLU stream (queue)
+    // Obtain current MLU stream (queue) - use the recommended API
     auto queue = torch_mlu::getCurMLUStream();
 
-    // Launch kernel using CUDA-like syntax
+    // Launch kernel
     dilated_conv2d_kernel<<<blocks, threads, 0, queue.stream()>>>(
         input_ptr, kernel_ptr, output_ptr,
         batch, in_channels, out_channels,
@@ -118,7 +117,7 @@ torch::Tensor bang_func(torch::Tensor x,
         kernel_size, dilation, padding
     );
 
-    // Synchronize (optional, caller may handle)
+    // Synchronize (optional, but ensures correctness for simple test)
     cnrtQueueSync(queue.stream());
 
     return output;
