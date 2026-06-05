@@ -3,57 +3,32 @@
 #include <cnrt.h>
 
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
-#define CHUNK_N 64
-#define CHUNK_K 256
 
-// 矩阵乘法：dst[M][N] = src[M][K] * weight[N][K]^T
-static void __nram__ matmul_block(
+// 计算一行输出: dst[n] = sum_{k=0}^{K-1} src[k] * weight[n][k]
+// src 长度为 K (在 NRAM 中)
+// weight 长度为 N*K (在 GDRAM 中，行优先存储)
+// dst 长度为 N (在 NRAM 中)
+static void __nram__ gemv_row(
     float *dst_nram,
-    float *src_gdram,
+    float *src_nram,
     float *weight_gdram,
-    int M, int K, int N,
-    float *workspace_nram)
+    int K, int N,
+    float *workspace_nram)  // workspace 长度至少 K
 {
-    __bang_write_zero(dst_nram, M * N);
-
-    for (int n_start = 0; n_start < N; n_start += CHUNK_N) {
-        int n_cur = MIN(CHUNK_N, N - n_start);
-        for (int k_start = 0; k_start < K; k_start += CHUNK_K) {
-            int k_cur = MIN(CHUNK_K, K - k_start);
-
-            // 加载权重子块 (n_cur, k_cur)
-            float *weight_sub = workspace_nram;
-            __memcpy(weight_sub,
-                     weight_gdram + n_start * K + k_start,
-                     n_cur * k_cur * sizeof(float),
-                     GDRAM2NRAM);
-
-            // 加载输入子块 (M, k_cur)
-            float *src_sub = workspace_nram + n_cur * k_cur;
-            __memcpy(src_sub,
-                     src_gdram + k_start,
-                     M * k_cur * sizeof(float),
-                     GDRAM2NRAM);
-
-            // 部分乘积 (M, k_cur) * (k_cur, n_cur) -> (M, n_cur)
-            float *partial = workspace_nram + n_cur * k_cur + M * k_cur;
-            // weight 存储为 (n_cur, k_cur)，需要转置，所以 trans_weight=1
-            __bang_matmul(partial, src_sub, weight_sub,
-                          M, k_cur, n_cur,
-                          0, 1);
-
-            // 累加到 dst
-            for (int i = 0; i < M; ++i) {
-                __bang_add(dst_nram + i * N + n_start,
-                           dst_nram + i * N + n_start,
-                           partial + i * n_cur,
-                           n_cur);
-            }
-        }
+    for (int n = 0; n < N; ++n) {
+        // 加载权重第 n 行到 workspace
+        __memcpy(workspace_nram,
+                 weight_gdram + n * K,
+                 K * sizeof(float),
+                 GDRAM2NRAM);
+        // 逐元素乘: src * weight_row
+        __bang_mul(workspace_nram, src_nram, workspace_nram, K);
+        // 求和得到 dst[n]
+        __bang_reduce_add(dst_nram + n, workspace_nram, K);
     }
 }
 
-// 单层 GRU 核函数
+// 单层 GRU 核函数，使用简单循环实现矩阵乘
 __mlu_entry__ void gru_layer_kernel(
     float *input_seq,
     float *output_seq,
@@ -76,60 +51,67 @@ __mlu_entry__ void gru_layer_kernel(
     int K_in = input_size;
     int K_hid = hidden_size;
 
-    // NRAM 分配 (根据最大可能维度预留)
-    __nram__ float nram_input[8192];
-    __nram__ float nram_hidden_prev[8192];
-    __nram__ float nram_gates[16384];
-    __nram__ float nram_new_hidden[8192];
-    __nram__ float nram_workspace[32768];
+    // NRAM 分配
+    __nram__ float nram_input[1024];          // 单行输入，最大 input_size=256，足够
+    __nram__ float nram_hidden_prev[1024];    // 单行隐藏状态
+    __nram__ float nram_gates[1536];          // 单行门输出 (3*hidden_size)
+    __nram__ float nram_new_hidden[512];      // 单行新隐藏状态
+    __nram__ float nram_workspace[1024];      // 临时空间
 
-    __bang_write_zero(nram_hidden_prev, M * hidden_size);
+    // 初始化隐藏状态为 0
+    for (int i = 0; i < M; ++i) {
+        float *h_ptr = nram_hidden_prev + i * hidden_size;
+        __bang_write_zero(h_ptr, hidden_size);
+    }
 
     for (int t = 0; t < seq_len; ++t) {
-        // 加载当前输入
-        float *in_ptr = input_seq + batch_start * seq_len * input_size + t * input_size;
-        __memcpy(nram_input, in_ptr, M * input_size * sizeof(float), GDRAM2NRAM);
-
-        // 输入门部分: input * weight_ih^T
-        matmul_block(nram_gates, nram_input, weight_ih,
-                     M, input_size, N, nram_workspace);
-        for (int i = 0; i < M; ++i)
-            __bang_add(nram_gates + i * N, nram_gates + i * N, bias_ih, N);
-
-        // 隐藏状态门部分: hidden_prev * weight_hh^T
-        matmul_block(nram_workspace, nram_hidden_prev, weight_hh,
-                     M, hidden_size, N, nram_workspace + M * N);
+        // 处理批次中的每个样本
         for (int i = 0; i < M; ++i) {
-            __bang_add(nram_gates + i * N, nram_gates + i * N, nram_workspace + i * N, N);
-            __bang_add(nram_gates + i * N, nram_gates + i * N, bias_hh, N);
-        }
+            // 加载当前样本的输入行
+            float *in_ptr = input_seq + (batch_start + i) * seq_len * input_size + t * input_size;
+            __memcpy(nram_input, in_ptr, input_size * sizeof(float), GDRAM2NRAM);
 
-        // 拆分三个门并计算新隐藏状态
-        for (int i = 0; i < M; ++i) {
-            float *gate = nram_gates + i * N;
-            float *z = gate;
-            float *r = gate + hidden_size;
-            float *h = gate + 2 * hidden_size;
+            // 计算输入门部分: input * weight_ih^T
+            gemv_row(nram_gates, nram_input, weight_ih,
+                     input_size, N, nram_workspace);
+
+            // 加上 bias_ih
+            __bang_add(nram_gates, nram_gates, bias_ih, N);
+
+            // 加载上一时刻隐藏状态
+            float *h_prev = nram_hidden_prev + i * hidden_size;
+
+            // 计算隐藏状态门部分: h_prev * weight_hh^T
+            gemv_row(nram_workspace, h_prev, weight_hh,
+                     hidden_size, N, nram_workspace + hidden_size);
+            __bang_add(nram_gates, nram_gates, nram_workspace, N);
+            __bang_add(nram_gates, nram_gates, bias_hh, N);
+
+            // 拆分三个门
+            float *z = nram_gates;
+            float *r = nram_gates + hidden_size;
+            float *h = nram_gates + 2 * hidden_size;
 
             __bang_active_sigmoid(z, z, hidden_size);
             __bang_active_sigmoid(r, r, hidden_size);
             __bang_active_tanh(h, h, hidden_size);
 
-            float *h_prev = nram_hidden_prev + i * hidden_size;
+            // 计算新隐藏状态: h_new = (1 - z) * h_prev + z * h
             float *h_new = nram_new_hidden + i * hidden_size;
-            // (1 - z) * h_prev + z * h
             __bang_sub_scalar(nram_workspace, z, 1.0f, hidden_size);
             __bang_mul(nram_workspace, nram_workspace, h_prev, hidden_size);
             __bang_mul(h_new, z, h, hidden_size);
             __bang_add(h_new, nram_workspace, h_new, hidden_size);
+
+            // 输出当前时间步
+            float *out_ptr = output_seq + (batch_start + i) * seq_len * hidden_size + t * hidden_size;
+            __memcpy(out_ptr, h_new, hidden_size * sizeof(float), NRAM2GDRAM);
+
+            // 更新隐藏状态（已经存储在 h_new，等待下一时间步）
+            // 下一轮会重新加载，因此无需显式拷贝，但需要将 h_new 写回 nram_hidden_prev
+            // 注意：nram_hidden_prev 中第 i 行的位置就是 h_prev，直接覆盖
+            __memcpy(h_prev, h_new, hidden_size * sizeof(float), NRAM2NRAM);
         }
-
-        // 输出当前时间步
-        float *out_ptr = output_seq + batch_start * seq_len * hidden_size + t * hidden_size;
-        __memcpy(out_ptr, nram_new_hidden, M * hidden_size * sizeof(float), NRAM2GDRAM);
-
-        // 更新隐藏状态
-        __memcpy(nram_hidden_prev, nram_new_hidden, M * hidden_size * sizeof(float), NRAM2NRAM);
     }
 }
 
@@ -155,7 +137,7 @@ at::Tensor bang_func(
     int batch = x_fp32.size(0);
     int seq_len = x_fp32.size(1);
 
-    // 使用 x.new_empty 分配输出，避免直接调用 torch::empty
+    // 使用 x.new_empty 分配输出
     at::Tensor output_fp32 = x.new_empty({batch, seq_len, hidden_size});
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();

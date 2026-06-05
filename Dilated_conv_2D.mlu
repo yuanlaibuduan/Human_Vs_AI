@@ -8,12 +8,12 @@
 #include <torch/extension.h>
 
 // -----------------------------------------------------------------------------
-// Kernel: each thread computes one output element
+// MLU kernel: each task computes one output element
 // -----------------------------------------------------------------------------
-__global__ void dilated_conv2d_kernel(
-    const float* __restrict__ input,
-    const float* __restrict__ kernel,
-    float* __restrict__ output,
+__mlu_global__ void dilated_conv2d_kernel(
+    const float* input,
+    const float* kernel,
+    float* output,
     int batch,
     int in_channels,
     int out_channels,
@@ -24,7 +24,7 @@ __global__ void dilated_conv2d_kernel(
     int padding
 ) {
     int total = batch * out_channels * H_out * W_out;
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int idx = taskId;   // BangC built-in variable for global task index
     if (idx >= total) return;
 
     // map linear index to (n, c_out, h, w)
@@ -39,7 +39,7 @@ __global__ void dilated_conv2d_kernel(
 
     // loop over input channels
     for (int ic = 0; ic < in_channels; ++ic) {
-        // loop over kernel window (with dilation)
+        // loop over kernel window with dilation
         for (int ky = 0; ky < kernel_size; ++ky) {
             int ih = oh + padding - dilation * ky;
             if (ih < 0 || ih >= H_in) continue;
@@ -67,7 +67,7 @@ __global__ void dilated_conv2d_kernel(
 }
 
 // -----------------------------------------------------------------------------
-// Host wrapper called from PyTorch
+// Host wrapper
 // -----------------------------------------------------------------------------
 torch::Tensor bang_func(torch::Tensor x,
                         torch::Tensor kernel,
@@ -76,17 +76,18 @@ torch::Tensor bang_func(torch::Tensor x,
                         int kernel_size,
                         int dilation,
                         int padding) {
-    // Move inputs to MLU device and convert to float32 if necessary
-    if (!x.is_mlu()) x = x.to(torch::kMLU);
-    if (!kernel.is_mlu()) kernel = kernel.to(torch::kMLU);
+    // Ensure inputs are on MLU and float32
+    x = x.contiguous();
+    kernel = kernel.contiguous();
+    if (x.device().type() != torch::kMLU) x = x.to(torch::kMLU);
+    if (kernel.device().type() != torch::kMLU) kernel = kernel.to(torch::kMLU);
     x = x.to(torch::kFloat);
     kernel = kernel.to(torch::kFloat);
 
     // Input dimensions
-    auto sizes = x.sizes();
-    int batch = sizes[0];
-    int H_in = sizes[2];
-    int W_in = sizes[3];
+    int batch = x.size(0);
+    int H_in = x.size(2);
+    int W_in = x.size(3);
 
     // Output spatial dimensions (stride = 1)
     int H_out = H_in + 2 * padding - dilation * (kernel_size - 1);
@@ -96,29 +97,51 @@ torch::Tensor bang_func(torch::Tensor x,
     torch::Tensor output = torch::empty({batch, out_channels, H_out, W_out},
                                         x.options().dtype(torch::kFloat));
 
-    // Raw pointers
+    // Get raw pointers
     const float* input_ptr = x.data_ptr<float>();
     const float* kernel_ptr = kernel.data_ptr<float>();
     float* output_ptr = output.data_ptr<float>();
 
-    // Launch configuration
-    int total = batch * out_channels * H_out * W_out;
-    int threads = 256;
-    int blocks = (total + threads - 1) / threads;
+    // Compute grid size: one task per output element
+    int total_tasks = batch * out_channels * H_out * W_out;
+    int tasks_per_cluster = 1024;  // typical value for MLU
+    cnrtDim3_t dim;
+    dim.x = (total_tasks + tasks_per_cluster - 1) / tasks_per_cluster;
+    dim.y = 1;
+    dim.z = 1;
+    cnrtFunctionType_t func_type = CNRT_FUNC_TYPE_BLOCK;
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream().stream();
 
-    // Obtain current MLU stream (queue) - use the recommended API
-    auto queue = torch_mlu::getCurMLUStream();
+    // Prepare kernel arguments
+    void* args[] = {
+        (void*)&input_ptr,
+        (void*)&kernel_ptr,
+        (void*)&output_ptr,
+        (void*)&batch,
+        (void*)&in_channels,
+        (void*)&out_channels,
+        (void*)&H_in,
+        (void*)&W_in,
+        (void*)&H_out,
+        (void*)&W_out,
+        (void*)&kernel_size,
+        (void*)&dilation,
+        (void*)&padding
+    };
 
     // Launch kernel
-    dilated_conv2d_kernel<<<blocks, threads, 0, queue.stream()>>>(
-        input_ptr, kernel_ptr, output_ptr,
-        batch, in_channels, out_channels,
-        H_in, W_in, H_out, W_out,
-        kernel_size, dilation, padding
-    );
+    CNRT_CHECK(cnrtInvokeKernel_V2(
+        (void*)&dilated_conv2d_kernel,
+        func_type,
+        dim,
+        tasks_per_cluster,
+        args,
+        13,          // number of arguments
+        nullptr,
+        queue));
 
-    // Synchronize (optional, but ensures correctness for simple test)
-    cnrtQueueSync(queue.stream());
+    // Optional: synchronize (usually caller handles)
+    cnrtQueueSync(queue);
 
     return output;
 }

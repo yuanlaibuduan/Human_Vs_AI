@@ -1,14 +1,13 @@
 // 051_cumsum.mlu
 // 沿指定维度计算累加前缀和（Cumulative Sum）
-// 策略：将目标维度置换到最后一维，每个核处理多个完整切片；
-//       每个切片一次性读入 NRAM，使用循环展开的串行累加（编译器自动向量化）。
+// 策略：将目标维度置换到最后一维，每个核心串行处理多个切片，
+//       使用最简单的累加循环，确保绝对正确性，并利用编译器优化。
 #include <bang.h>
 #include <cnrt.h>
 #include <torch/extension.h>
 #include <vector>
 
-#define MAX_SLICE_LEN 8192   // 最大切片长度（4000 以内，留有余量）
-#define CORE_NUM       64     // 使用的计算核心数（充分利用 MLU 并行能力）
+#define CORE_NUM 4   // 匹配实际硬件核心数（MLU 典型值）
 
 // 核函数：对每个切片执行 inclusive prefix sum
 __mlu_entry__ void cumsum_kernel(float* input, float* output,
@@ -22,37 +21,16 @@ __mlu_entry__ void cumsum_kernel(float* input, float* output,
     int end_slice = start_slice + slices_per_core;
     if (end_slice > slice_count) end_slice = slice_count;
 
-    // NRAM 缓冲区
-    __nram__ float nram_data[MAX_SLICE_LEN];
-
     for (int s = start_slice; s < end_slice; ++s) {
         float* in_ptr  = input  + s * slice_len;
         float* out_ptr = output + s * slice_len;
-
-        // 将整个切片从 GDRAM 加载到 NRAM
-        __memcpy(nram_data, in_ptr, slice_len * sizeof(float), GDRAM2NRAM);
-
-        // 手动前缀和，循环展开 4 次，利于编译器向量化
         float acc = 0.0f;
-        int i = 0;
-        #pragma unroll 4
-        for (; i + 3 < slice_len; i += 4) {
-            acc += nram_data[i];
-            nram_data[i] = acc;
-            acc += nram_data[i+1];
-            nram_data[i+1] = acc;
-            acc += nram_data[i+2];
-            nram_data[i+2] = acc;
-            acc += nram_data[i+3];
-            nram_data[i+3] = acc;
-        }
-        for (; i < slice_len; ++i) {
-            acc += nram_data[i];
-            nram_data[i] = acc;
-        }
 
-        // 将结果写回 GDRAM
-        __memcpy(out_ptr, nram_data, slice_len * sizeof(float), NRAM2GDRAM);
+        // 直接累加，不经过 NRAM 缓冲（避免不必要的内存拷贝）
+        for (int i = 0; i < slice_len; ++i) {
+            acc += in_ptr[i];
+            out_ptr[i] = acc;
+        }
     }
 }
 
@@ -83,8 +61,6 @@ torch::Tensor bang_func(torch::Tensor x, int dim) {
 
     int64_t slice_len = x_fp32.size(-1);
     int64_t slice_count = x_fp32.numel() / slice_len;
-    TORCH_CHECK(slice_len <= MAX_SLICE_LEN,
-                "Slice length exceeds MAX_SLICE_LEN, please increase the macro.");
 
     auto output_fp32 = torch::empty_like(x_fp32);
 
