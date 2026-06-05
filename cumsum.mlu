@@ -1,14 +1,14 @@
 // 051_cumsum.mlu
 // 沿指定维度计算累加前缀和（Cumulative Sum）
 // 策略：将目标维度置换到最后一维，每个核处理多个完整切片；
-//       每个切片一次性读入 NRAM，使用向量化循环进行串行累加（利用 __bang_cycle_add 或手动展开）。
+//       每个切片一次性读入 NRAM，使用循环展开的串行累加（编译器自动向量化）。
 #include <bang.h>
 #include <cnrt.h>
 #include <torch/extension.h>
 #include <vector>
 
 #define MAX_SLICE_LEN 8192   // 最大切片长度（4000 以内，留有余量）
-#define CORE_NUM       16     // 使用的计算核心数
+#define CORE_NUM       64     // 使用的计算核心数（充分利用 MLU 并行能力）
 
 // 核函数：对每个切片执行 inclusive prefix sum
 __mlu_entry__ void cumsum_kernel(float* input, float* output,
@@ -32,10 +32,24 @@ __mlu_entry__ void cumsum_kernel(float* input, float* output,
         // 将整个切片从 GDRAM 加载到 NRAM
         __memcpy(nram_data, in_ptr, slice_len * sizeof(float), GDRAM2NRAM);
 
-        // 使用硬件加速的前缀和指令（5 个参数）
-        // __bang_cycle_add(dst, src, elem_count, cycle_len, stride)
-        // 当 cycle_len = 1, stride = 1 时，计算 inclusive prefix sum
-        __bang_cycle_add(nram_data, nram_data, slice_len, 1, 1);
+        // 手动前缀和，循环展开 4 次，利于编译器向量化
+        float acc = 0.0f;
+        int i = 0;
+        #pragma unroll 4
+        for (; i + 3 < slice_len; i += 4) {
+            acc += nram_data[i];
+            nram_data[i] = acc;
+            acc += nram_data[i+1];
+            nram_data[i+1] = acc;
+            acc += nram_data[i+2];
+            nram_data[i+2] = acc;
+            acc += nram_data[i+3];
+            nram_data[i+3] = acc;
+        }
+        for (; i < slice_len; ++i) {
+            acc += nram_data[i];
+            nram_data[i] = acc;
+        }
 
         // 将结果写回 GDRAM
         __memcpy(out_ptr, nram_data, slice_len * sizeof(float), NRAM2GDRAM);
