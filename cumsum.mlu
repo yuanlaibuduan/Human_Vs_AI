@@ -1,15 +1,10 @@
 // 051_cumsum.mlu
-// 沿指定维度计算累加前缀和（Cumulative Sum）
-// 策略：将目标维度置换到最后一维，每个核心串行处理多个切片，
-//       使用最简单的累加循环，确保绝对正确性，并利用编译器优化。
 #include <bang.h>
 #include <cnrt.h>
 #include <torch/extension.h>
 #include <vector>
 
-#define CORE_NUM 4   // 匹配实际硬件核心数（MLU 典型值）
-
-// 核函数：对每个切片执行 inclusive prefix sum
+// 核函数：每个核心处理若干个独立的切片，直接进行顺序累加
 __mlu_entry__ void cumsum_kernel(float* input, float* output,
                                  int slice_len, int slice_count) {
     uint32_t core_id = taskId;
@@ -26,7 +21,7 @@ __mlu_entry__ void cumsum_kernel(float* input, float* output,
         float* out_ptr = output + s * slice_len;
         float acc = 0.0f;
 
-        // 直接累加，不经过 NRAM 缓冲（避免不必要的内存拷贝）
+        // 顺序累加，与 torch.cumsum 完全一致
         for (int i = 0; i < slice_len; ++i) {
             acc += in_ptr[i];
             out_ptr[i] = acc;
@@ -34,9 +29,8 @@ __mlu_entry__ void cumsum_kernel(float* input, float* output,
     }
 }
 
-// 外部封装函数
 torch::Tensor bang_func(torch::Tensor x, int dim) {
-    // 确保输入连续，处理负数维度
+    // 确保输入连续
     x = x.contiguous();
     int64_t ndim = x.dim();
     if (dim < 0) dim += ndim;
@@ -56,7 +50,7 @@ torch::Tensor bang_func(torch::Tensor x, int dim) {
         x = x.permute(perm).contiguous();
     }
 
-    // 转换为 float32 进行计算
+    // 统一转为 float32 进行计算，避免半精度累加误差
     torch::Tensor x_fp32 = (original_dtype == torch::kFloat) ? x : x.to(torch::kFloat);
 
     int64_t slice_len = x_fp32.size(-1);
@@ -66,7 +60,7 @@ torch::Tensor bang_func(torch::Tensor x, int dim) {
 
     // 获取当前 MLU 流队列
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t dim_grid = {CORE_NUM, 1, 1};
+    cnrtDim3_t dim_grid = {4, 1, 1};          // 使用 4 个核心并行处理切片
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
     cumsum_kernel<<<dim_grid, ktype, queue>>>(
@@ -86,7 +80,7 @@ torch::Tensor bang_func(torch::Tensor x, int dim) {
         result = result.permute(inv_perm).contiguous();
     }
 
-    // 转换回原始数据类型
+    // 转换回原始数据类型（如 FP16）
     if (original_dtype != torch::kFloat) {
         result = result.to(original_dtype);
     }
