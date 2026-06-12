@@ -1,0 +1,81 @@
+#include <bang.h>
+#include <cnrt.h>
+#include <torch/extension.h>
+
+#define CHUNK_SIZE 4096
+#define EPSILON 1e-10f
+
+__mlu_entry__ void kl_div_kernel(
+    const float *input_log_prob,
+    const float *target_prob,
+    float *kl_terms,
+    int total) {
+
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+    uint32_t per_core = total / core_num;
+    uint32_t remainder = total % core_num;
+    uint32_t start = core_id * per_core + (core_id < remainder ? core_id : remainder);
+    uint32_t count = per_core + (core_id < remainder ? 1 : 0);
+
+    __nram__ float nram_log_prob[CHUNK_SIZE];
+    __nram__ float nram_target[CHUNK_SIZE];
+    __nram__ float nram_result[CHUNK_SIZE];
+    __nram__ float nram_log_target[CHUNK_SIZE];
+    __nram__ float nram_eps[CHUNK_SIZE];
+
+    for (uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
+        uint32_t len = (offset + CHUNK_SIZE <= count) ? CHUNK_SIZE : (count - offset);
+        uint32_t aligned_len = (len + 63) & ~63;
+
+        __memcpy(nram_log_prob,
+                 input_log_prob + start + offset,
+                 len * sizeof(float),
+                 GDRAM2NRAM);
+        __memcpy(nram_target,
+                 target_prob + start + offset,
+                 len * sizeof(float),
+                 GDRAM2NRAM);
+
+        // log(target_prob + epsilon) for numerical stability
+        __bang_add_scalar(nram_log_target, nram_target, EPSILON, aligned_len);
+        __bang_log(nram_log_target, nram_log_target, aligned_len);
+
+        // log(target_prob + epsilon) - input_log_prob
+        __bang_sub(nram_log_target, nram_log_target, nram_log_prob, aligned_len);
+
+        // target_prob * (log(target_prob + epsilon) - input_log_prob)
+        __bang_mul(nram_result, nram_target, nram_log_target, aligned_len);
+
+        __memcpy(kl_terms + start + offset,
+                 nram_result,
+                 len * sizeof(float),
+                 NRAM2GDRAM);
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor input_log_prob, torch::Tensor target_prob) {
+    TORCH_CHECK(input_log_prob.is_contiguous(), "input_log_prob must be contiguous");
+    TORCH_CHECK(target_prob.is_contiguous(), "target_prob must be contiguous");
+    TORCH_CHECK(input_log_prob.dim() == 2, "input_log_prob must be 2D [batch, N]");
+    TORCH_CHECK(target_prob.sizes() == input_log_prob.sizes(),
+                "target_prob must have same shape as input_log_prob");
+
+    auto log_prob_fp32 = input_log_prob.to(torch::kFloat);
+    auto target_fp32 = target_prob.to(torch::kFloat);
+    auto kl_terms = torch::empty_like(log_prob_fp32);
+
+    int total = static_cast<int>(log_prob_fp32.numel());
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    cnrtDim3_t dim = {4, 1, 1};
+    kl_div_kernel<<<dim, ktype, queue>>>(
+        log_prob_fp32.data_ptr<float>(),
+        target_fp32.data_ptr<float>(),
+        kl_terms.data_ptr<float>(),
+        total);
+
+    // Sum over N dimension, then average over batch dimension (batchmean)
+    return kl_terms.sum() / kl_terms.size(0);
+}
