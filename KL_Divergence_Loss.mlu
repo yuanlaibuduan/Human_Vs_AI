@@ -3,12 +3,12 @@
 #include <torch/extension.h>
 
 #define CHUNK_SIZE 4096
-#define EPSILON 1e-10f
 
 __mlu_entry__ void kl_div_kernel(
-    const float *input_log_prob,
     const float *target_prob,
-    float *kl_terms,
+    const float *log_target,
+    const float *input_log_prob,
+    float *output,
     int total) {
 
     uint32_t core_id = taskId;
@@ -18,36 +18,35 @@ __mlu_entry__ void kl_div_kernel(
     uint32_t start = core_id * per_core + (core_id < remainder ? core_id : remainder);
     uint32_t count = per_core + (core_id < remainder ? 1 : 0);
 
-    __nram__ float nram_log_prob[CHUNK_SIZE];
     __nram__ float nram_target[CHUNK_SIZE];
-    __nram__ float nram_result[CHUNK_SIZE];
     __nram__ float nram_log_target[CHUNK_SIZE];
-    __nram__ float nram_eps[CHUNK_SIZE];
+    __nram__ float nram_input_log[CHUNK_SIZE];
+    __nram__ float nram_diff[CHUNK_SIZE];
+    __nram__ float nram_result[CHUNK_SIZE];
 
     for (uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
         uint32_t len = (offset + CHUNK_SIZE <= count) ? CHUNK_SIZE : (count - offset);
         uint32_t aligned_len = (len + 63) & ~63;
 
-        __memcpy(nram_log_prob,
-                 input_log_prob + start + offset,
-                 len * sizeof(float),
-                 GDRAM2NRAM);
         __memcpy(nram_target,
                  target_prob + start + offset,
                  len * sizeof(float),
                  GDRAM2NRAM);
+        __memcpy(nram_log_target,
+                 log_target + start + offset,
+                 len * sizeof(float),
+                 GDRAM2NRAM);
+        __memcpy(nram_input_log,
+                 input_log_prob + start + offset,
+                 len * sizeof(float),
+                 GDRAM2NRAM);
 
-        // log(target_prob + epsilon) for numerical stability
-        __bang_add_scalar(nram_log_target, nram_target, EPSILON, aligned_len);
-        __bang_log(nram_log_target, nram_log_target, aligned_len);
+        // log_target - input_log_prob
+        __bang_sub(nram_diff, nram_log_target, nram_input_log, aligned_len);
+        // target * (log_target - input_log_prob)
+        __bang_mul(nram_result, nram_target, nram_diff, aligned_len);
 
-        // log(target_prob + epsilon) - input_log_prob
-        __bang_sub(nram_log_target, nram_log_target, nram_log_prob, aligned_len);
-
-        // target_prob * (log(target_prob + epsilon) - input_log_prob)
-        __bang_mul(nram_result, nram_target, nram_log_target, aligned_len);
-
-        __memcpy(kl_terms + start + offset,
+        __memcpy(output + start + offset,
                  nram_result,
                  len * sizeof(float),
                  NRAM2GDRAM);
@@ -63,7 +62,11 @@ torch::Tensor bang_func(torch::Tensor input_log_prob, torch::Tensor target_prob)
 
     auto log_prob_fp32 = input_log_prob.to(torch::kFloat);
     auto target_fp32 = target_prob.to(torch::kFloat);
-    auto kl_terms = torch::empty_like(log_prob_fp32);
+
+    // Compute log(target + eps) on the host side for better numerical precision
+    auto log_target = torch::log(target_fp32 + 1e-8f);
+
+    auto output = torch::empty_like(log_prob_fp32);
 
     int total = static_cast<int>(log_prob_fp32.numel());
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
@@ -71,11 +74,13 @@ torch::Tensor bang_func(torch::Tensor input_log_prob, torch::Tensor target_prob)
 
     cnrtDim3_t dim = {4, 1, 1};
     kl_div_kernel<<<dim, ktype, queue>>>(
-        log_prob_fp32.data_ptr<float>(),
         target_fp32.data_ptr<float>(),
-        kl_terms.data_ptr<float>(),
+        log_target.data_ptr<float>(),
+        log_prob_fp32.data_ptr<float>(),
+        output.data_ptr<float>(),
         total);
 
-    // Sum over N dimension, then average over batch dimension (batchmean)
-    return kl_terms.sum() / kl_terms.size(0);
+    // KL divergence with batchmean reduction:
+    // sum(target * (log(target) - input_log_prob)) / batch_size
+    return output.sum() / output.size(0);
 }
