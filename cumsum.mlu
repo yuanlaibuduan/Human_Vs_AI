@@ -1,6 +1,7 @@
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
+#include <vector>
 
 #define NRAM_SIZE 4096  // NRAM 大小（元素数量）
 
@@ -54,12 +55,7 @@ __mlu_entry__ void cumsum_kernel(
                 GDRAM2NRAM
             );
             
-            // 计算前缀和（并行扫描）
-            // 首先复制到临时缓冲区
-            __bang_move(nram_prefix, nram_data, aligned_chunk_size);
-            
-            // 对每个元素累加前缀和（串行扫描，因为前缀和需要依赖关系）
-            // 使用循环计算前缀和
+            // 计算前缀和
             float running_sum = prefix_sum;
             for (int i = 0; i < chunk_size; i++) {
                 running_sum += nram_data[i];
@@ -106,7 +102,9 @@ torch::Tensor bang_func(torch::Tensor x, int dim) {
     }
     
     // 计算 outer_size, dim_size, inner_size
-    std::vector<int64_t> shape = input_fp32.sizes();
+    auto sizes = input_fp32.sizes();
+    std::vector<int64_t> shape(sizes.begin(), sizes.end());
+    
     int64_t outer_size = 1;
     for (int i = 0; i < dim; i++) {
         outer_size *= shape[i];
