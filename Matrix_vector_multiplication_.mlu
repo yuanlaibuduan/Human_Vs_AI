@@ -3,7 +3,7 @@
 #include <torch/extension.h>
 
 #define CHUNK_SIZE 4096   // 每次处理向量的分块大小
-#define ALIGN_SIZE 64     // 对齐字节数 (64 * sizeof(float))
+#define ALIGN_SIZE 64     // 对齐大小
 
 // 核函数：矩阵 (M, K) 乘向量 (K, 1) -> 向量 (M, 1)
 __mlu_entry__ void gemv_kernel(float* A, float* B, float* C, int M, int K) {
@@ -20,6 +20,7 @@ __mlu_entry__ void gemv_kernel(float* A, float* B, float* C, int M, int K) {
     __nram__ float nram_A[CHUNK_SIZE];
     __nram__ float nram_B[CHUNK_SIZE];
     __nram__ float nram_prod[CHUNK_SIZE];
+    __nram__ float nram_sum[1];  // 用于存储 reduce sum 的结果
 
     for (int row = start_row; row < end_row; ++row) {
         float sum = 0.0f;
@@ -36,7 +37,7 @@ __mlu_entry__ void gemv_kernel(float* A, float* B, float* C, int M, int K) {
             // 从全局内存加载 B 的当前块
             __memcpy(nram_B, B + k, len * sizeof(float), GDRAM2NRAM);
 
-            // 将多余部分清零，避免 reduce sum 时引入垃圾值
+            // 将多余部分清零
             if (aligned_len > len) {
                 __bang_write_zero(nram_A + len, aligned_len - len);
                 __bang_write_zero(nram_B + len, aligned_len - len);
@@ -45,10 +46,9 @@ __mlu_entry__ void gemv_kernel(float* A, float* B, float* C, int M, int K) {
             // 逐元素相乘：prod = A * B
             __bang_mul(nram_prod, nram_A, nram_B, aligned_len);
 
-            // 将乘积向量求和得到块内部分和
-            float block_sum = 0.0f;
-            __bang_reduce_sum(&block_sum, nram_prod, aligned_len);
-            sum += block_sum;
+            // 求和：将乘积向量求和得到块内部分和
+            __bang_reduce_sum(nram_sum, nram_prod, aligned_len);
+            sum += nram_sum[0];
         }
         C[row] = sum;   // 输出向量 C 形状 [M, 1]
     }
@@ -78,7 +78,7 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
     // 获取 MLU 队列
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
-    // 设置核函数启动维度（这里使用 4 个 Union1 核，可根据实际硬件调整）
+    // 设置核函数启动维度
     cnrtDim3_t dim = {4, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
