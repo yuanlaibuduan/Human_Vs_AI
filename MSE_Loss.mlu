@@ -1,24 +1,20 @@
-#include <torch/extension.h>
+#include <bang.h>
 #include <cnrt.h>
+#include <torch/extension.h>
 
-// 提示：4096 作为 CHUNK_SIZE 偏小（仅占用 16KB NRAM），可以适当调大至 16384 提升访存吞吐
-#define CHUNK_SIZE 4096 
-// 适当调大了分块大小以提升 NRAM 访存吞吐
-#define CHUNK_SIZE 16384 
+#define CHUNK_SIZE 4096
+#define TASK_NUM 4
 
-__mlu_entry__ void mse_kernel(
-    float* predictions,
-@@ -17,67 +17,61 @@ __mlu_entry__ void mse_kernel(
+__mlu_entry__ void mse_partial_sum_kernel(
+    const float *predictions,
+    const float *targets,
+    float *partial_sums,
+    int total) {
+
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
     uint32_t per_core = total / core_num;
     uint32_t remainder = total % core_num;
-
-    uint32_t start =
-        core_id * per_core +
-        (core_id < remainder ? core_id : remainder);
-
-    uint32_t count =
-        per_core +
-        (core_id < remainder ? 1 : 0);
     uint32_t start = core_id * per_core + (core_id < remainder ? core_id : remainder);
     uint32_t count = per_core + (core_id < remainder ? 1 : 0);
 
@@ -26,107 +22,72 @@ __mlu_entry__ void mse_kernel(
     __nram__ float nram_target[CHUNK_SIZE];
     __nram__ float nram_diff[CHUNK_SIZE];
 
-    for(uint32_t offset = 0;
-        offset < count;
-        offset += CHUNK_SIZE) {
-
-        uint32_t len =
-            (offset + CHUNK_SIZE <= count)
-                ? CHUNK_SIZE
-                : (count - offset);
-    for(uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
-
-        uint32_t aligned_len =
-            (len + 63) & ~63;
+    float local_sum = 0.0f;
+    for (uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
         uint32_t len = (offset + CHUNK_SIZE <= count) ? CHUNK_SIZE : (count - offset);
         uint32_t aligned_len = (len + 63) & ~63;
 
-        __memcpy(
-            nram_pred,
-            predictions + start + offset,
-            len * sizeof(float),
-            GDRAM2NRAM);
-            GDRAM2NRAM
-        );
+        __memcpy(nram_pred,
+                 predictions + start + offset,
+                 len * sizeof(float),
+                 GDRAM2NRAM);
+        __memcpy(nram_target,
+                 targets + start + offset,
+                 len * sizeof(float),
+                 GDRAM2NRAM);
 
-        __memcpy(
-            nram_target,
-            targets + start + offset,
-            len * sizeof(float),
-            GDRAM2NRAM);
-            GDRAM2NRAM
-        );
+        __bang_sub(nram_diff, nram_pred, nram_target, aligned_len);
+        __bang_mul(nram_diff, nram_diff, nram_diff, aligned_len);
 
-        // diff = pred - target
-        __bang_sub(
-            nram_diff,
-            nram_pred,
-            nram_target,
-            aligned_len);
-            aligned_len
-        );
-
-        // diff^2
-        __bang_mul(
-            nram_diff,
-            nram_diff,
-            nram_diff,
-            aligned_len);
-            aligned_len
-        );
-
-        // 只写回实际有效的数据长度 (len)，避免把 padding 的脏数据写回全局内存
-        // 只写回实际有效的数据长度 (len)，规避脏数据越界
-        __memcpy(
-            output + start + offset,
-            nram_diff,
-            len * sizeof(float),
-            NRAM2GDRAM);
-            NRAM2GDRAM
-        );
+        for (uint32_t i = 0; i < len; ++i) {
+            local_sum += nram_diff[i];
+        }
     }
+
+    partial_sums[core_id] = local_sum;
 }
 
-// 缺失的 C++ 接口（必须严格匹配 2 个 Tensor 参数的签名）
-// 供外部测试框架调用的完整 C++ 接口
+__mlu_entry__ void mse_final_kernel(
+    const float *partial_sums,
+    float *loss,
+    int total,
+    int partial_count) {
+
+    float sum = 0.0f;
+    for (int i = 0; i < partial_count; ++i) {
+        sum += partial_sums[i];
+    }
+    loss[0] = sum / static_cast<float>(total);
+}
+
 torch::Tensor bang_func(torch::Tensor predictions, torch::Tensor targets) {
-    
-    // 逻辑防御：确保输入内存连续且形状对齐
     TORCH_CHECK(predictions.is_contiguous(), "predictions must be contiguous");
     TORCH_CHECK(targets.is_contiguous(), "targets must be contiguous");
-@@ -89,15 +83,15 @@ torch::Tensor bang_func(torch::Tensor predictions, torch::Tensor targets) {
-    auto pred_fp32 = (original_dtype == torch::kFloat) ? predictions : predictions.to(torch::kFloat);
-    auto target_fp32 = (targets.scalar_type() == torch::kFloat) ? targets : targets.to(torch::kFloat);
+    TORCH_CHECK(predictions.dim() == 2, "predictions must be 2D [batch, dim]");
+    TORCH_CHECK(targets.sizes() == predictions.sizes(), "targets must have same shape as predictions");
 
-    // 分配与输入形状一致的输出张量 (Element-wise MSE)
-    // 分配与输入形状一致的中间输出张量 (存放 Element-wise 的平方差)
-    auto output_fp32 = torch::empty_like(pred_fp32);
+    auto pred_fp32 = predictions.to(torch::kFloat);
+    auto target_fp32 = targets.to(torch::kFloat);
+    auto partial_sums = torch::empty({TASK_NUM}, pred_fp32.options());
+    auto loss = torch::empty({}, pred_fp32.options());
 
-    int total = pred_fp32.numel();
-
-    // 获取当前 MLU 执行流
-    // 获取当前 MLU 执行流并启动 Kernel
+    int total = static_cast<int>(pred_fp32.numel());
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-
-    // 调度配置：使用 4 核执行 (taskDim = 4)
-    // 调度配置：使用 4 核执行并发
-    cnrtDim3_t dim = {4, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
-@@ -108,10 +102,13 @@ torch::Tensor bang_func(torch::Tensor predictions, torch::Tensor targets) {
-        total
-    );
+    cnrtDim3_t partial_dim = {TASK_NUM, 1, 1};
+    mse_partial_sum_kernel<<<partial_dim, ktype, queue>>>(
+        pred_fp32.data_ptr<float>(),
+        target_fp32.data_ptr<float>(),
+        partial_sums.data_ptr<float>(),
+        total);
 
-    // 如果原数据类型不是 float32，则转换回去
-    // 执行归约求均值，将矩阵形状压缩为框架要求的标量 ()
-    auto loss_mean = output_fp32.mean();
+    cnrtDim3_t final_dim = {1, 1, 1};
+    mse_final_kernel<<<final_dim, ktype, queue>>>(
+        partial_sums.data_ptr<float>(),
+        loss.data_ptr<float>(),
+        total,
+        TASK_NUM);
 
-    // 恢复原始数据类型返回
-    if (original_dtype != torch::kFloat) {
-        return output_fp32.to(original_dtype);
-        return loss_mean.to(original_dtype);
-    }
-
-    return output_fp32;
-    return loss_mean;
+    return loss;
 }
