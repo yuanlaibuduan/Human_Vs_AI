@@ -1,84 +1,100 @@
+// 023_Matrix_vector_multiplication_.mlu
 #include <bang.h>
-#include <cnrt.h>
 #include <torch/extension.h>
+#include <cnrt.h>
 
-#define CHUNK_SIZE 4096   // 每次处理向量的分块大小
-#define ALIGN_SIZE 64     // 对齐大小
+#define CHUNK_SIZE 4096   // 增大分块以充分利用 NRAM
 
-// 核函数：矩阵 (M, K) 乘向量 (K, 1) -> 向量 (M, 1)
+// ------------------------------------------------------------
+// 核函数：矩阵向量乘法 C = A * B
+// A: [M, K] 行优先存储
+// B: [K, 1] 连续存储
+// C: [M, 1] 输出
+// ------------------------------------------------------------
 __mlu_entry__ void gemv_kernel(float* A, float* B, float* C, int M, int K) {
+    // 获取当前 core 的 ID 和总 core 数量
     uint32_t core_id = taskId;
     uint32_t core_num = taskDim;
 
-    // 分配每个 core 处理的行范围
-    int rows_per_core = M / core_num;
-    int remainder = M % core_num;
-    int start_row = core_id * rows_per_core + (core_id < remainder ? core_id : remainder);
-    int end_row = start_row + rows_per_core + (core_id < remainder ? 1 : 0);
+    // 将 M 行分配给各个 core
+    uint32_t per_core = M / core_num;
+    uint32_t remainder = M % core_num;
+    uint32_t start_row = core_id * per_core + (core_id < remainder ? core_id : remainder);
+    uint32_t num_rows = per_core + (core_id < remainder ? 1 : 0);
 
-    // NRAM 缓冲区
-    __nram__ float nram_A[CHUNK_SIZE];
-    __nram__ float nram_B[CHUNK_SIZE];
-    __nram__ float nram_prod[CHUNK_SIZE];
-    __nram__ float nram_sum[1];  // 用于存储 reduce sum 的结果
+    if (num_rows == 0) return;
 
-    for (int row = start_row; row < end_row; ++row) {
-        float sum = 0.0f;
-        float* A_row = A + row * K;
+    // NRAM 缓冲区：B 的分块和 A 行中对应列的分块
+    __nram__ float B_chunk[CHUNK_SIZE];
+    __nram__ float A_chunk[CHUNK_SIZE];
+    __nram__ float tmp[CHUNK_SIZE];
 
-        // 分块计算点积
-        for (int k = 0; k < K; k += CHUNK_SIZE) {
-            int len = CHUNK_SIZE;
-            if (k + len > K) len = K - k;
-            int aligned_len = (len + ALIGN_SIZE - 1) & ~(ALIGN_SIZE - 1);
+    // 对当前 core 负责的每一行进行计算
+    for (uint32_t i = 0; i < num_rows; ++i) {
+        uint32_t row = start_row + i;
+        float acc = 0.0f;
 
-            // 从全局内存加载 A 的当前块
-            __memcpy(nram_A, A_row + k, len * sizeof(float), GDRAM2NRAM);
+        // 按块处理列维度
+        for (uint32_t k_start = 0; k_start < K; k_start += CHUNK_SIZE) {
+            uint32_t cur_len = (k_start + CHUNK_SIZE <= K) ? CHUNK_SIZE : (K - k_start);
+            uint32_t aligned_len = (cur_len + 63) & ~63;  // 64 字节对齐
+
             // 从全局内存加载 B 的当前块
-            __memcpy(nram_B, B + k, len * sizeof(float), GDRAM2NRAM);
+            __memcpy(B_chunk, B + k_start, cur_len * sizeof(float), GDRAM2NRAM);
+            // 从全局内存加载 A 当前行的当前列块
+            __memcpy(A_chunk, A + row * K + k_start, cur_len * sizeof(float), GDRAM2NRAM);
 
-            // 将多余部分清零
-            if (aligned_len > len) {
-                __bang_write_zero(nram_A + len, aligned_len - len);
-                __bang_write_zero(nram_B + len, aligned_len - len);
+            // 使用 BangC 向量指令：逐元素相乘
+            __bang_mul(tmp, A_chunk, B_chunk, aligned_len);
+
+            // 规约求和：将 tmp 的所有元素累加到 acc
+            for (uint32_t j = 0; j < cur_len; ++j) {
+                acc += tmp[j];
             }
-
-            // 逐元素相乘：prod = A * B
-            __bang_mul(nram_prod, nram_A, nram_B, aligned_len);
-
-            // 求和：将乘积向量求和得到块内部分和
-            __bang_reduce_sum(nram_sum, nram_prod, aligned_len);
-            sum += nram_sum[0];
         }
-        C[row] = sum;   // 输出向量 C 形状 [M, 1]
+
+        // 将结果写回全局内存
+        C[row] = acc;
     }
 }
 
-// 对外接口函数
+// ------------------------------------------------------------
+// 外部调用接口
+// 输入：A (M, K), B (K, 1)
+// 输出：C (M, 1)
+// ------------------------------------------------------------
 torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
-    // 输入检查
+    // 检查张量是否连续
     TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
     TORCH_CHECK(B.is_contiguous(), "B must be contiguous");
-    TORCH_CHECK(A.dim() == 2, "A must be 2D matrix [M, K]");
-    TORCH_CHECK(B.dim() == 2 && B.size(1) == 1, "B must be 2D vector [K, 1]");
-    TORCH_CHECK(A.size(1) == B.size(0), "Inner dimensions must match: A.shape[1] == B.shape[0]");
 
-    // 获取形状
-    int M = A.size(0);
-    int K = A.size(1);
+    // 保存原始数据类型
+    auto original_dtype_A = A.scalar_type();
+    auto original_dtype_B = B.scalar_type();
 
-    // 转换为 float32 进行内部计算 (根据题目要求)
-    auto original_dtype = A.scalar_type();
-    torch::Tensor A_fp32 = (original_dtype == torch::kFloat) ? A : A.to(torch::kFloat);
-    torch::Tensor B_fp32 = (original_dtype == torch::kFloat) ? B : B.to(torch::kFloat);
+    // 转换为 float32 类型（参考实现内部使用 fp32）
+    torch::Tensor A_fp32 = A;
+    torch::Tensor B_fp32 = B;
+    if (A.scalar_type() != torch::kFloat) {
+        A_fp32 = A.to(torch::kFloat);
+    }
+    if (B.scalar_type() != torch::kFloat) {
+        B_fp32 = B.to(torch::kFloat);
+    }
 
-    // 分配输出张量 [M, 1]
-    torch::Tensor C_fp32 = torch::empty({M, 1}, A_fp32.options());
+    // 获取矩阵尺寸
+    int M = A_fp32.size(0);
+    int K = A_fp32.size(1);
+    TORCH_CHECK(B_fp32.size(0) == K && B_fp32.size(1) == 1,
+                "B shape must be (K, 1)");
 
-    // 获取 MLU 队列
+    // 分配输出张量，形状 (M, 1)
+    torch::Tensor C_fp32 = torch::empty({M, 1}, torch::dtype(torch::kFloat).device(A.device()));
+
+    // 获取当前 MLU 流（队列）
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
-    // 设置核函数启动维度
+    // 配置核函数启动参数：使用 4 个 core，统一风格
     cnrtDim3_t dim = {4, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
@@ -90,9 +106,11 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
         M, K
     );
 
-    // 将结果转回原始数据类型
-    if (original_dtype != torch::kFloat) {
-        return C_fp32.to(original_dtype);
+    // 还原原始数据类型
+    torch::Tensor C = C_fp32;
+    if (original_dtype_A != torch::kFloat || original_dtype_B != torch::kFloat) {
+        // 如果任一输入是半精度，输出也转回半精度
+        C = C_fp32.to(original_dtype_A);
     }
-    return C_fp32;
+    return C;
 }
