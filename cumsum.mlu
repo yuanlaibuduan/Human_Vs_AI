@@ -1,88 +1,150 @@
-// 051_cumsum.mlu
 #include <bang.h>
-#include <cnrt.h>
 #include <torch/extension.h>
-#include <vector>
+#include <cnrt.h>
 
-// 核函数：每个核心处理若干个独立的切片，直接进行顺序累加
-__mlu_entry__ void cumsum_kernel(float* input, float* output,
-                                 int slice_len, int slice_count) {
+#define NRAM_SIZE 4096  // NRAM 大小（元素数量）
+
+// 核函数：计算一维数组的前缀和
+__mlu_entry__ void cumsum_kernel(
+    float *input,
+    float *output,
+    int outer_size,      // 外部维度大小（dim 之前的维度乘积）
+    int inner_size,      // 内部维度大小（dim 之后的维度乘积）
+    int dim_size) {      // dim 维度的大小
+    
+    __nram__ float nram_data[NRAM_SIZE];
+    __nram__ float nram_prefix[NRAM_SIZE];
+    
     uint32_t core_id = taskId;
     uint32_t core_num = taskDim;
-
-    // 将切片均匀分配给各个核心
-    int slices_per_core = (slice_count + core_num - 1) / core_num;
-    int start_slice = core_id * slices_per_core;
-    int end_slice = start_slice + slices_per_core;
-    if (end_slice > slice_count) end_slice = slice_count;
-
-    for (int s = start_slice; s < end_slice; ++s) {
-        float* in_ptr  = input  + s * slice_len;
-        float* out_ptr = output + s * slice_len;
-        float acc = 0.0f;
-
-        // 顺序累加，与 torch.cumsum 完全一致
-        for (int i = 0; i < slice_len; ++i) {
-            acc += in_ptr[i];
-            out_ptr[i] = acc;
+    
+    // 总共有 outer_size * inner_size 个独立的序列需要处理
+    int total_sequences = outer_size * inner_size;
+    
+    // 分配任务给不同的核
+    int seq_per_core = total_sequences / core_num;
+    int remainder = total_sequences % core_num;
+    
+    int start_seq = core_id * seq_per_core + (core_id < remainder ? core_id : remainder);
+    int seq_count = seq_per_core + (core_id < remainder ? 1 : 0);
+    
+    for (int seq_idx = 0; seq_idx < seq_count; seq_idx++) {
+        int seq_id = start_seq + seq_idx;
+        
+        // 计算当前序列在输入张量中的起始位置
+        int outer_idx = seq_id / inner_size;
+        int inner_idx = seq_id % inner_size;
+        
+        int base_idx = outer_idx * (dim_size * inner_size) + inner_idx;
+        
+        // 处理当前序列：对长度为 dim_size 的序列计算前缀和
+        int remaining = dim_size;
+        int offset = 0;
+        float prefix_sum = 0.0f;
+        
+        while (remaining > 0) {
+            int chunk_size = (remaining < NRAM_SIZE) ? remaining : NRAM_SIZE;
+            int aligned_chunk_size = (chunk_size + 63) & ~63;
+            
+            // 从 GDRAM 读取数据到 NRAM
+            __memcpy(
+                nram_data,
+                input + base_idx + offset * inner_size,
+                chunk_size * sizeof(float),
+                GDRAM2NRAM
+            );
+            
+            // 计算前缀和（并行扫描）
+            // 首先复制到临时缓冲区
+            __bang_move(nram_prefix, nram_data, aligned_chunk_size);
+            
+            // 对每个元素累加前缀和（串行扫描，因为前缀和需要依赖关系）
+            // 使用循环计算前缀和
+            float running_sum = prefix_sum;
+            for (int i = 0; i < chunk_size; i++) {
+                running_sum += nram_data[i];
+                nram_prefix[i] = running_sum;
+            }
+            prefix_sum = running_sum;
+            
+            // 将结果写回 GDRAM
+            __memcpy(
+                output + base_idx + offset * inner_size,
+                nram_prefix,
+                chunk_size * sizeof(float),
+                NRAM2GDRAM
+            );
+            
+            remaining -= chunk_size;
+            offset += chunk_size;
         }
     }
 }
 
 torch::Tensor bang_func(torch::Tensor x, int dim) {
-    // 确保输入连续
-    x = x.contiguous();
-    int64_t ndim = x.dim();
-    if (dim < 0) dim += ndim;
-    TORCH_CHECK(dim >= 0 && dim < ndim, "Invalid dimension");
-
-    auto original_dtype = x.scalar_type();
-
-    // 将目标维度置换到最后一维，使切片内存连续
-    bool need_permute = (dim != ndim - 1);
-    std::vector<int64_t> perm;
-    if (need_permute) {
-        perm.reserve(ndim);
-        for (int64_t i = 0; i < ndim; ++i) {
-            if (i != dim) perm.push_back(i);
-        }
-        perm.push_back(dim);
-        x = x.permute(perm).contiguous();
-    }
-
-    // 统一转为 float32 进行计算，避免半精度累加误差
-    torch::Tensor x_fp32 = (original_dtype == torch::kFloat) ? x : x.to(torch::kFloat);
-
-    int64_t slice_len = x_fp32.size(-1);
-    int64_t slice_count = x_fp32.numel() / slice_len;
-
-    auto output_fp32 = torch::empty_like(x_fp32);
-
-    // 获取当前 MLU 流队列
-    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t dim_grid = {4, 1, 1};          // 使用 4 个核心并行处理切片
-    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
-
-    cumsum_kernel<<<dim_grid, ktype, queue>>>(
-        x_fp32.data_ptr<float>(),
-        output_fp32.data_ptr<float>(),
-        static_cast<int>(slice_len),
-        static_cast<int>(slice_count)
+    // 检查输入张量是否连续
+    TORCH_CHECK(
+        x.is_contiguous(),
+        "Input tensor must be contiguous"
     );
-
-    // 恢复原始维度顺序
-    torch::Tensor result = output_fp32;
-    if (need_permute) {
-        std::vector<int64_t> inv_perm(ndim);
-        for (int64_t i = 0; i < ndim; ++i) {
-            inv_perm[perm[i]] = i;
-        }
-        result = result.permute(inv_perm).contiguous();
+    
+    // 处理负数维度
+    int ndim = x.dim();
+    if (dim < 0) {
+        dim += ndim;
     }
-
-    // 转换回原始数据类型（如 FP16）
+    TORCH_CHECK(
+        dim >= 0 && dim < ndim,
+        "Dimension out of range"
+    );
+    
+    // 转换为 FP32
+    auto original_dtype = x.scalar_type();
+    torch::Tensor input_fp32 = x;
     if (original_dtype != torch::kFloat) {
-        result = result.to(original_dtype);
+        input_fp32 = x.to(torch::kFloat);
     }
-    return result;
+    
+    // 计算 outer_size, dim_size, inner_size
+    std::vector<int64_t> shape = input_fp32.sizes();
+    int64_t outer_size = 1;
+    for (int i = 0; i < dim; i++) {
+        outer_size *= shape[i];
+    }
+    
+    int64_t dim_size = shape[dim];
+    
+    int64_t inner_size = 1;
+    for (int i = dim + 1; i < ndim; i++) {
+        inner_size *= shape[i];
+    }
+    
+    // 创建输出张量
+    auto output_fp32 = torch::empty_like(input_fp32);
+    
+    // 获取队列
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    
+    // 配置核函数启动参数
+    cnrtDim3_t dim_grid = {4, 1, 1};  // 使用4个核
+    cnrtFunctionType_t kernel_type = cnrtFuncTypeUnion1;
+    
+    // 启动核函数
+    cumsum_kernel<<<dim_grid, kernel_type, queue>>>(
+        input_fp32.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
+        outer_size,
+        inner_size,
+        dim_size
+    );
+    
+    // 同步等待完成
+    cnrtQueueSync(queue);
+    
+    // 转换回原始数据类型
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
+    }
+    
+    return output_fp32;
 }
