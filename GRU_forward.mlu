@@ -3,119 +3,124 @@
 #include <cnrt.h>
 #include <math.h>
 
-#define MAX_INPUT_SIZE 512
-#define MAX_HIDDEN_SIZE 512
+__mlu_entry__ void gru_zero_hidden_kernel(
+    float *h0,
+    float *h1,
+    int total) {
 
-__mlu_entry__ void gru_forward_kernel(
+    for (int idx = taskId; idx < total; idx += taskDim) {
+        h0[idx] = 0.0f;
+        h1[idx] = 0.0f;
+    }
+}
+
+__mlu_entry__ void gru_layer0_step_kernel(
     float *x,
-    float *weight_ih_l0,
-    float *weight_hh_l0,
-    float *bias_ih_l0,
-    float *bias_hh_l0,
-    float *weight_ih_l1,
-    float *weight_hh_l1,
-    float *bias_ih_l1,
-    float *bias_hh_l1,
-    float *output,
+    float *h_prev,
+    float *h_next,
+    float *weight_ih,
+    float *weight_hh,
+    float *bias_ih,
+    float *bias_hh,
+    int time_idx,
     int batch,
     int seq_len,
     int input_size,
     int hidden_size) {
 
-    __nram__ float input_buf[MAX_INPUT_SIZE];
-    __nram__ float h0_prev[MAX_HIDDEN_SIZE];
-    __nram__ float h0_new[MAX_HIDDEN_SIZE];
-    __nram__ float h1_prev[MAX_HIDDEN_SIZE];
-    __nram__ float h1_new[MAX_HIDDEN_SIZE];
+    int total = batch * hidden_size;
 
-    for (int b = taskId; b < batch; b += taskDim) {
-        for (int h = 0; h < hidden_size; ++h) {
-            h0_prev[h] = 0.0f;
-            h1_prev[h] = 0.0f;
+    for (int idx = taskId; idx < total; idx += taskDim) {
+        int b = idx / hidden_size;
+        int h = idx - b * hidden_size;
+
+        int row_r = h;
+        int row_z = hidden_size + h;
+        int row_n = 2 * hidden_size + h;
+
+        float ir = bias_ih[row_r];
+        float iz = bias_ih[row_z];
+        float in_gate = bias_ih[row_n];
+        float hr = bias_hh[row_r];
+        float hz = bias_hh[row_z];
+        float hn = bias_hh[row_n];
+
+        int x_base = (b * seq_len + time_idx) * input_size;
+        for (int i = 0; i < input_size; ++i) {
+            float v = x[x_base + i];
+            ir += weight_ih[row_r * input_size + i] * v;
+            iz += weight_ih[row_z * input_size + i] * v;
+            in_gate += weight_ih[row_n * input_size + i] * v;
         }
 
-        for (int t = 0; t < seq_len; ++t) {
-            __memcpy(
-                input_buf,
-                x + (b * seq_len + t) * input_size,
-                input_size * sizeof(float),
-                GDRAM2NRAM);
-
-            for (int h = 0; h < hidden_size; ++h) {
-                int row_r = h;
-                int row_z = hidden_size + h;
-                int row_n = 2 * hidden_size + h;
-
-                float ir = bias_ih_l0[row_r];
-                float iz = bias_ih_l0[row_z];
-                float in_gate = bias_ih_l0[row_n];
-                float hr = bias_hh_l0[row_r];
-                float hz = bias_hh_l0[row_z];
-                float hn = bias_hh_l0[row_n];
-
-                for (int i = 0; i < input_size; ++i) {
-                    float v = input_buf[i];
-                    ir += weight_ih_l0[row_r * input_size + i] * v;
-                    iz += weight_ih_l0[row_z * input_size + i] * v;
-                    in_gate += weight_ih_l0[row_n * input_size + i] * v;
-                }
-
-                for (int i = 0; i < hidden_size; ++i) {
-                    float prev = h0_prev[i];
-                    hr += weight_hh_l0[row_r * hidden_size + i] * prev;
-                    hz += weight_hh_l0[row_z * hidden_size + i] * prev;
-                    hn += weight_hh_l0[row_n * hidden_size + i] * prev;
-                }
-
-                float r = 1.0f / (1.0f + expf(-(ir + hr)));
-                float z = 1.0f / (1.0f + expf(-(iz + hz)));
-                float n_val = tanhf(in_gate + r * hn);
-                h0_new[h] = n_val + z * (h0_prev[h] - n_val);
-            }
-
-            for (int h = 0; h < hidden_size; ++h) {
-                int row_r = h;
-                int row_z = hidden_size + h;
-                int row_n = 2 * hidden_size + h;
-
-                float ir = bias_ih_l1[row_r];
-                float iz = bias_ih_l1[row_z];
-                float in_gate = bias_ih_l1[row_n];
-                float hr = bias_hh_l1[row_r];
-                float hz = bias_hh_l1[row_z];
-                float hn = bias_hh_l1[row_n];
-
-                for (int i = 0; i < hidden_size; ++i) {
-                    float v = h0_new[i];
-                    ir += weight_ih_l1[row_r * hidden_size + i] * v;
-                    iz += weight_ih_l1[row_z * hidden_size + i] * v;
-                    in_gate += weight_ih_l1[row_n * hidden_size + i] * v;
-                }
-
-                for (int i = 0; i < hidden_size; ++i) {
-                    float prev = h1_prev[i];
-                    hr += weight_hh_l1[row_r * hidden_size + i] * prev;
-                    hz += weight_hh_l1[row_z * hidden_size + i] * prev;
-                    hn += weight_hh_l1[row_n * hidden_size + i] * prev;
-                }
-
-                float r = 1.0f / (1.0f + expf(-(ir + hr)));
-                float z = 1.0f / (1.0f + expf(-(iz + hz)));
-                float n_val = tanhf(in_gate + r * hn);
-                h1_new[h] = n_val + z * (h1_prev[h] - n_val);
-            }
-
-            __memcpy(
-                output + (b * seq_len + t) * hidden_size,
-                h1_new,
-                hidden_size * sizeof(float),
-                NRAM2GDRAM);
-
-            for (int h = 0; h < hidden_size; ++h) {
-                h0_prev[h] = h0_new[h];
-                h1_prev[h] = h1_new[h];
-            }
+        int h_base = b * hidden_size;
+        for (int i = 0; i < hidden_size; ++i) {
+            float prev = h_prev[h_base + i];
+            hr += weight_hh[row_r * hidden_size + i] * prev;
+            hz += weight_hh[row_z * hidden_size + i] * prev;
+            hn += weight_hh[row_n * hidden_size + i] * prev;
         }
+
+        float r = 1.0f / (1.0f + expf(-(ir + hr)));
+        float z = 1.0f / (1.0f + expf(-(iz + hz)));
+        float n_val = tanhf(in_gate + r * hn);
+        h_next[h_base + h] = n_val + z * (h_prev[h_base + h] - n_val);
+    }
+}
+
+__mlu_entry__ void gru_layer1_step_kernel(
+    float *layer_input,
+    float *h_prev,
+    float *h_next,
+    float *weight_ih,
+    float *weight_hh,
+    float *bias_ih,
+    float *bias_hh,
+    float *output,
+    int time_idx,
+    int batch,
+    int seq_len,
+    int hidden_size) {
+
+    int total = batch * hidden_size;
+
+    for (int idx = taskId; idx < total; idx += taskDim) {
+        int b = idx / hidden_size;
+        int h = idx - b * hidden_size;
+
+        int row_r = h;
+        int row_z = hidden_size + h;
+        int row_n = 2 * hidden_size + h;
+
+        float ir = bias_ih[row_r];
+        float iz = bias_ih[row_z];
+        float in_gate = bias_ih[row_n];
+        float hr = bias_hh[row_r];
+        float hz = bias_hh[row_z];
+        float hn = bias_hh[row_n];
+
+        int h_base = b * hidden_size;
+        for (int i = 0; i < hidden_size; ++i) {
+            float v = layer_input[h_base + i];
+            ir += weight_ih[row_r * hidden_size + i] * v;
+            iz += weight_ih[row_z * hidden_size + i] * v;
+            in_gate += weight_ih[row_n * hidden_size + i] * v;
+        }
+
+        for (int i = 0; i < hidden_size; ++i) {
+            float prev = h_prev[h_base + i];
+            hr += weight_hh[row_r * hidden_size + i] * prev;
+            hz += weight_hh[row_z * hidden_size + i] * prev;
+            hn += weight_hh[row_n * hidden_size + i] * prev;
+        }
+
+        float r = 1.0f / (1.0f + expf(-(ir + hr)));
+        float z = 1.0f / (1.0f + expf(-(iz + hz)));
+        float n_val = tanhf(in_gate + r * hn);
+        float new_h = n_val + z * (h_prev[h_base + h] - n_val);
+
+        h_next[h_base + h] = new_h;
+        output[(b * seq_len + time_idx) * hidden_size + h] = new_h;
     }
 }
 
@@ -136,8 +141,6 @@ torch::Tensor bang_func(
     TORCH_CHECK(x.dim() == 3, "Input x must be [batch, seq_len, input_size]");
     TORCH_CHECK(x.size(2) == input_size, "input_size mismatch");
     TORCH_CHECK(num_layers == 2, "This implementation expects num_layers == 2");
-    TORCH_CHECK(input_size <= MAX_INPUT_SIZE, "input_size exceeds local buffer");
-    TORCH_CHECK(hidden_size <= MAX_HIDDEN_SIZE, "hidden_size exceeds local buffer");
 
     TORCH_CHECK(weight_ih_l0.size(0) == 3 * hidden_size &&
                     weight_ih_l0.size(1) == input_size,
@@ -195,30 +198,68 @@ torch::Tensor bang_func(
 
     int batch = x_fp32.size(0);
     int seq_len = x_fp32.size(1);
-    TORCH_CHECK(batch > 0 && seq_len > 0, "GRU input dimensions must be non-empty");
+    TORCH_CHECK(batch > 0 && seq_len > 0 && hidden_size > 0,
+                "GRU input dimensions must be non-empty");
 
     torch::Tensor output_fp32 =
         torch::empty({batch, seq_len, hidden_size}, x_fp32.options());
+    torch::Tensor h0_a = torch::empty({batch, hidden_size}, x_fp32.options());
+    torch::Tensor h0_b = torch::empty({batch, hidden_size}, x_fp32.options());
+    torch::Tensor h1_a = torch::empty({batch, hidden_size}, x_fp32.options());
+    torch::Tensor h1_b = torch::empty({batch, hidden_size}, x_fp32.options());
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t kdim = {32, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
-    gru_forward_kernel<<<kdim, ktype, queue>>>(
-        x_fp32.data_ptr<float>(),
-        w_ih0.data_ptr<float>(),
-        w_hh0.data_ptr<float>(),
-        b_ih0.data_ptr<float>(),
-        b_hh0.data_ptr<float>(),
-        w_ih1.data_ptr<float>(),
-        w_hh1.data_ptr<float>(),
-        b_ih1.data_ptr<float>(),
-        b_hh1.data_ptr<float>(),
-        output_fp32.data_ptr<float>(),
-        batch,
-        seq_len,
-        input_size,
-        hidden_size);
+    int hidden_total = batch * hidden_size;
+    gru_zero_hidden_kernel<<<kdim, ktype, queue>>>(
+        h0_a.data_ptr<float>(),
+        h1_a.data_ptr<float>(),
+        hidden_total);
+
+    torch::Tensor h0_prev = h0_a;
+    torch::Tensor h0_next = h0_b;
+    torch::Tensor h1_prev = h1_a;
+    torch::Tensor h1_next = h1_b;
+
+    for (int t = 0; t < seq_len; ++t) {
+        gru_layer0_step_kernel<<<kdim, ktype, queue>>>(
+            x_fp32.data_ptr<float>(),
+            h0_prev.data_ptr<float>(),
+            h0_next.data_ptr<float>(),
+            w_ih0.data_ptr<float>(),
+            w_hh0.data_ptr<float>(),
+            b_ih0.data_ptr<float>(),
+            b_hh0.data_ptr<float>(),
+            t,
+            batch,
+            seq_len,
+            input_size,
+            hidden_size);
+
+        gru_layer1_step_kernel<<<kdim, ktype, queue>>>(
+            h0_next.data_ptr<float>(),
+            h1_prev.data_ptr<float>(),
+            h1_next.data_ptr<float>(),
+            w_ih1.data_ptr<float>(),
+            w_hh1.data_ptr<float>(),
+            b_ih1.data_ptr<float>(),
+            b_hh1.data_ptr<float>(),
+            output_fp32.data_ptr<float>(),
+            t,
+            batch,
+            seq_len,
+            hidden_size);
+
+        torch::Tensor tmp0 = h0_prev;
+        h0_prev = h0_next;
+        h0_next = tmp0;
+
+        torch::Tensor tmp1 = h1_prev;
+        h1_prev = h1_next;
+        h1_next = tmp1;
+    }
 
     if (original_dtype != torch::kFloat) {
         return output_fp32.to(original_dtype);
