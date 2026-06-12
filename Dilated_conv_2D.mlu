@@ -1,147 +1,169 @@
-// 135_Dilated_conv_2D.mlu
-// BangC implementation of 2D dilated convolution with padding.
-// Input: x [batch, in_channels, H, W], kernel [out_channels, in_channels, kernel_size, kernel_size]
-// Output: convolution result [batch, out_channels, H_out, W_out]
-
 #include <bang.h>
-#include <cnrt.h>
 #include <torch/extension.h>
+#include <cnrt.h>
 
-// -----------------------------------------------------------------------------
-// MLU kernel: each task computes one output element
-// -----------------------------------------------------------------------------
-__mlu_global__ void dilated_conv2d_kernel(
-    const float* input,
-    const float* kernel,
-    float* output,
-    int batch,
+#define TILE_W 256
+#define ALIGN_UP_64(x) (((x) + 63) & ~63)
+
+__mlu_entry__ void dilated_conv2d_kernel(
+    float *x,
+    float *kernel,
+    float *output,
+    int total_rows,
     int in_channels,
     int out_channels,
-    int H_in, int W_in,
-    int H_out, int W_out,
+    int in_h,
+    int in_w,
+    int out_h,
+    int out_w,
     int kernel_size,
     int dilation,
-    int padding
-) {
-    int total = batch * out_channels * H_out * W_out;
-    int idx = taskId;   // BangC built-in variable for global task index
-    if (idx >= total) return;
+    int padding) {
 
-    // map linear index to (n, c_out, h, w)
-    int n = idx / (out_channels * H_out * W_out);
-    int rem = idx % (out_channels * H_out * W_out);
-    int oc = rem / (H_out * W_out);
-    rem = rem % (H_out * W_out);
-    int oh = rem / W_out;
-    int ow = rem % W_out;
+    int task_id = taskId;
+    int task_num = taskDim;
 
-    float sum = 0.0f;
+    __nram__ float nram_acc[TILE_W + 64];
+    __nram__ float nram_input[TILE_W + 64];
+    __nram__ float nram_prod[TILE_W + 64];
 
-    // loop over input channels
-    for (int ic = 0; ic < in_channels; ++ic) {
-        // loop over kernel window with dilation
-        for (int ky = 0; ky < kernel_size; ++ky) {
-            int ih = oh + padding - dilation * ky;
-            if (ih < 0 || ih >= H_in) continue;
-            for (int kx = 0; kx < kernel_size; ++kx) {
-                int iw = ow + padding - dilation * kx;
-                if (iw < 0 || iw >= W_in) continue;
+    for (int row = task_id; row < total_rows; row += task_num) {
+        int row_tmp = row;
+        int oh = row_tmp % out_h;
+        row_tmp /= out_h;
+        int oc = row_tmp % out_channels;
+        int n = row_tmp / out_channels;
 
-                // input value
-                float in_val = input[n * in_channels * H_in * W_in +
-                                     ic * H_in * W_in +
-                                     ih * W_in + iw];
-                // kernel weight
-                float k_val = kernel[oc * in_channels * kernel_size * kernel_size +
-                                     ic * kernel_size * kernel_size +
-                                     ky * kernel_size + kx];
-                sum += in_val * k_val;
+        for (int ow_base = 0; ow_base < out_w; ow_base += TILE_W) {
+            int tile_len = out_w - ow_base;
+            if (tile_len > TILE_W) {
+                tile_len = TILE_W;
             }
+            int aligned_tile = ALIGN_UP_64(tile_len);
+
+            __bang_write_zero(nram_acc, aligned_tile);
+
+            for (int ic = 0; ic < in_channels; ++ic) {
+                for (int kh = 0; kh < kernel_size; ++kh) {
+                    int ih = oh + kh * dilation - padding;
+                    if (ih < 0 || ih >= in_h) {
+                        continue;
+                    }
+
+                    for (int kw = 0; kw < kernel_size; ++kw) {
+                        int iw_first = ow_base + kw * dilation - padding;
+                        int valid_start = 0;
+                        int valid_end = tile_len;
+
+                        if (iw_first < 0) {
+                            valid_start = -iw_first;
+                        }
+                        if (iw_first + valid_end > in_w) {
+                            valid_end = in_w - iw_first;
+                        }
+                        if (valid_start >= valid_end) {
+                            continue;
+                        }
+
+                        int valid_len = valid_end - valid_start;
+                        int input_offset =
+                            ((n * in_channels + ic) * in_h + ih) * in_w +
+                            iw_first + valid_start;
+                        int kernel_offset =
+                            ((oc * in_channels + ic) * kernel_size + kh) *
+                            kernel_size + kw;
+
+                        __bang_write_zero(nram_input, aligned_tile);
+                        __memcpy(
+                            nram_input + valid_start,
+                            x + input_offset,
+                            valid_len * sizeof(float),
+                            GDRAM2NRAM);
+
+                        __bang_mul_scalar(
+                            nram_prod,
+                            nram_input,
+                            kernel[kernel_offset],
+                            aligned_tile);
+                        __bang_add(
+                            nram_acc,
+                            nram_acc,
+                            nram_prod,
+                            aligned_tile);
+                    }
+                }
+            }
+
+            int output_offset =
+                ((n * out_channels + oc) * out_h + oh) * out_w + ow_base;
+            __memcpy(
+                output + output_offset,
+                nram_acc,
+                tile_len * sizeof(float),
+                NRAM2GDRAM);
         }
     }
-
-    // write output
-    output[n * out_channels * H_out * W_out +
-           oc * H_out * W_out +
-           oh * W_out + ow] = sum;
 }
 
-// -----------------------------------------------------------------------------
-// Host wrapper
-// -----------------------------------------------------------------------------
-torch::Tensor bang_func(torch::Tensor x,
-                        torch::Tensor kernel,
-                        int in_channels,
-                        int out_channels,
-                        int kernel_size,
-                        int dilation,
-                        int padding) {
-    // Ensure inputs are on MLU and float32
-    x = x.contiguous();
-    kernel = kernel.contiguous();
-    if (x.device().type() != torch::kMLU) x = x.to(torch::kMLU);
-    if (kernel.device().type() != torch::kMLU) kernel = kernel.to(torch::kMLU);
-    x = x.to(torch::kFloat);
-    kernel = kernel.to(torch::kFloat);
+torch::Tensor bang_func(
+    torch::Tensor x,
+    torch::Tensor kernel,
+    int in_channels,
+    int out_channels,
+    int kernel_size,
+    int dilation,
+    int padding) {
 
-    // Input dimensions
-    int batch = x.size(0);
-    int H_in = x.size(2);
-    int W_in = x.size(3);
+    TORCH_CHECK(x.dim() == 4, "Input x must be a 4D NCHW tensor");
+    TORCH_CHECK(kernel.dim() == 4, "Kernel must be a 4D OIHW tensor");
+    TORCH_CHECK(x.size(1) == in_channels, "Input channel mismatch");
+    TORCH_CHECK(kernel.size(0) == out_channels, "Output channel mismatch");
+    TORCH_CHECK(kernel.size(1) == in_channels, "Kernel input channel mismatch");
+    TORCH_CHECK(kernel.size(2) == kernel_size, "Kernel height mismatch");
+    TORCH_CHECK(kernel.size(3) == kernel_size, "Kernel width mismatch");
 
-    // Output spatial dimensions (stride = 1)
-    int H_out = H_in + 2 * padding - dilation * (kernel_size - 1);
-    int W_out = W_in + 2 * padding - dilation * (kernel_size - 1);
+    torch::Tensor x_fp32 =
+        x.scalar_type() == torch::kFloat ? x.contiguous()
+                                         : x.to(torch::kFloat).contiguous();
+    torch::Tensor kernel_fp32 =
+        kernel.scalar_type() == torch::kFloat
+            ? kernel.contiguous()
+            : kernel.to(torch::kFloat).contiguous();
 
-    // Allocate output tensor on MLU
-    torch::Tensor output = torch::empty({batch, out_channels, H_out, W_out},
-                                        x.options().dtype(torch::kFloat));
+    int batch = x_fp32.size(0);
+    int in_h = x_fp32.size(2);
+    int in_w = x_fp32.size(3);
+    int out_h =
+        (in_h + 2 * padding - dilation * (kernel_size - 1) - 1) + 1;
+    int out_w =
+        (in_w + 2 * padding - dilation * (kernel_size - 1) - 1) + 1;
 
-    // Get raw pointers
-    const float* input_ptr = x.data_ptr<float>();
-    const float* kernel_ptr = kernel.data_ptr<float>();
-    float* output_ptr = output.data_ptr<float>();
+    TORCH_CHECK(out_h > 0 && out_w > 0, "Invalid convolution output shape");
 
-    // Compute grid size: one task per output element
-    int total_tasks = batch * out_channels * H_out * W_out;
-    int tasks_per_cluster = 1024;  // typical value for MLU
-    cnrtDim3_t dim;
-    dim.x = (total_tasks + tasks_per_cluster - 1) / tasks_per_cluster;
-    dim.y = 1;
-    dim.z = 1;
-    cnrtFunctionType_t func_type = CNRT_FUNC_TYPE_BLOCK;
-    cnrtQueue_t queue = torch_mlu::getCurMLUStream().stream();
+    auto output = torch::empty(
+        {batch, out_channels, out_h, out_w},
+        x_fp32.options());
 
-    // Prepare kernel arguments
-    void* args[] = {
-        (void*)&input_ptr,
-        (void*)&kernel_ptr,
-        (void*)&output_ptr,
-        (void*)&batch,
-        (void*)&in_channels,
-        (void*)&out_channels,
-        (void*)&H_in,
-        (void*)&W_in,
-        (void*)&H_out,
-        (void*)&W_out,
-        (void*)&kernel_size,
-        (void*)&dilation,
-        (void*)&padding
-    };
+    int total_rows = batch * out_channels * out_h;
 
-    // Launch kernel
-    CNRT_CHECK(cnrtInvokeKernel_V2(
-        (void*)&dilated_conv2d_kernel,
-        func_type,
-        dim,
-        tasks_per_cluster,
-        args,
-        13,          // number of arguments
-        nullptr,
-        queue));
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
-    // Optional: synchronize (usually caller handles)
-    cnrtQueueSync(queue);
+    dilated_conv2d_kernel<<<dim, ktype, queue>>>(
+        x_fp32.data_ptr<float>(),
+        kernel_fp32.data_ptr<float>(),
+        output.data_ptr<float>(),
+        total_rows,
+        in_channels,
+        out_channels,
+        in_h,
+        in_w,
+        out_h,
+        out_w,
+        kernel_size,
+        dilation,
+        padding);
 
     return output;
 }
