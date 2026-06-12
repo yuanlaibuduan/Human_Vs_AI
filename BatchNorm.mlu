@@ -1,116 +1,161 @@
-// BatchNorm.cpp
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
-#include <cmath>
+#include <math.h>
 
-#define CHUNK_SIZE 4096
-#define EPS 1e-5f
+#define BN_PARTS 256
+#define BN_EPS 0.00001f
 
-// MLU kernel: BatchNorm2d in training mode
-// Per-channel batch statistics over (N, H, W)
-// Formula: y = (x - mean) / sqrt(var + eps)
-// Two-pass algorithm: pass1 computes mean+variance, pass2 normalizes
-__mlu_entry__ void batchnorm_kernel(
-    float *input,
-    float *output,
-    int B,
-    int CI,
-    int HW)
-{
-    uint32_t core_id = taskId;
-    uint32_t core_num = taskDim;
+__mlu_entry__ void batchnorm_reduce_kernel(
+    float *x,
+    float *partial_sum,
+    float *partial_sumsq,
+    int batch,
+    int channel,
+    int height,
+    int width) {
 
-    // Distribute channels across cores
-    int ci_per_core = CI / core_num;
-    int ci_rem = CI % core_num;
-    int ci_start = core_id * ci_per_core
-                 + (core_id < (uint32_t)ci_rem ? core_id : ci_rem);
-    int ci_count = ci_per_core
-                 + (core_id < (uint32_t)ci_rem ? 1 : 0);
+    int spatial = height * width;
+    int count_per_channel = batch * spatial;
+    int total_tasks = channel * BN_PARTS;
 
-    __nram__ float buf[CHUNK_SIZE];
-    int total_per_ch = B * HW;
+    for (int task = taskId; task < total_tasks; task += taskDim) {
+        int c = task / BN_PARTS;
+        int part = task - c * BN_PARTS;
+        int begin = part * count_per_channel / BN_PARTS;
+        int end = (part + 1) * count_per_channel / BN_PARTS;
 
-    for (int ci_idx = 0; ci_idx < ci_count; ci_idx++) {
-        int c = ci_start + ci_idx;
-
-        // =========================================
-        // Pass 1: Compute sum and sum_sq for this channel
-        // =========================================
         float sum = 0.0f;
-        float sum_sq = 0.0f;
-        
-        for (int b = 0; b < B; b++) {
-            float* src = input + b * CI * HW + c * HW;
+        float sumsq = 0.0f;
 
-            for (int off = 0; off < HW; off += CHUNK_SIZE) {
-                int len = (off + CHUNK_SIZE <= HW) ? CHUNK_SIZE : (HW - off);
-                __memcpy(buf, src + off, len * sizeof(float), GDRAM2NRAM);
-
-                for (int i = 0; i < len; i++) {
-                    float x = buf[i];
-                    sum += x;
-                    sum_sq += x * x;
-                }
-            }
+        for (int linear = begin; linear < end; ++linear) {
+            int n = linear / spatial;
+            int rem = linear - n * spatial;
+            float v = x[(n * channel + c) * spatial + rem];
+            sum += v;
+            sumsq += v * v;
         }
-        
-        float mean = sum / (float)total_per_ch;
-        float var = sum_sq / (float)total_per_ch - mean * mean;
-        if (var < 0.0f) var = 0.0f;
-        float inv_std = 1.0f / sqrtf(var + EPS);
 
-        // =========================================
-        // Pass 2: Normalize and write output
-        // =========================================
-        for (int b = 0; b < B; b++) {
-            float* src = input + b * CI * HW + c * HW;
-            float* dst = output + b * CI * HW + c * HW;
+        partial_sum[task] = sum;
+        partial_sumsq[task] = sumsq;
+    }
+}
 
-            for (int off = 0; off < HW; off += CHUNK_SIZE) {
-                int len = (off + CHUNK_SIZE <= HW) ? CHUNK_SIZE : (HW - off);
-                __memcpy(buf, src + off, len * sizeof(float), GDRAM2NRAM);
+__mlu_entry__ void batchnorm_finalize_kernel(
+    float *partial_sum,
+    float *partial_sumsq,
+    float *mean,
+    float *inv_std,
+    int batch,
+    int channel,
+    int height,
+    int width) {
 
-                for (int i = 0; i < len; i++) {
-                    buf[i] = (buf[i] - mean) * inv_std;
-                }
+    int count_per_channel = batch * height * width;
 
-                __memcpy(dst + off, buf, len * sizeof(float), NRAM2GDRAM);
-            }
+    for (int c = taskId; c < channel; c += taskDim) {
+        float sum = 0.0f;
+        float sumsq = 0.0f;
+        int base = c * BN_PARTS;
+
+        for (int part = 0; part < BN_PARTS; ++part) {
+            sum += partial_sum[base + part];
+            sumsq += partial_sumsq[base + part];
         }
+
+        float m = sum / (float)count_per_channel;
+        float var = sumsq / (float)count_per_channel - m * m;
+        if (var < 0.0f) {
+            var = 0.0f;
+        }
+
+        mean[c] = m;
+        inv_std[c] = 1.0f / sqrtf(var + BN_EPS);
+    }
+}
+
+__mlu_entry__ void batchnorm_apply_kernel(
+    float *x,
+    float *output,
+    float *mean,
+    float *inv_std,
+    int total,
+    int channel,
+    int height,
+    int width) {
+
+    int spatial = height * width;
+
+    for (int idx = taskId; idx < total; idx += taskDim) {
+        int nc = idx / spatial;
+        int c = nc - (nc / channel) * channel;
+        output[idx] = (x[idx] - mean[c]) * inv_std[c];
     }
 }
 
 torch::Tensor bang_func(torch::Tensor x, int num_features) {
-    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
+    TORCH_CHECK(x.dim() == 4, "Input x must be a 4D NCHW tensor");
+    TORCH_CHECK(x.size(1) == num_features, "num_features must match x.size(1)");
 
     auto original_dtype = x.scalar_type();
-    torch::Tensor input_fp32 = x;
-    if (original_dtype != torch::kFloat) {
-        input_fp32 = x.to(torch::kFloat);
-    }
+    torch::Tensor x_fp32 =
+        original_dtype == torch::kFloat ? x.contiguous()
+                                        : x.to(torch::kFloat).contiguous();
 
-    int B  = input_fp32.size(0);
-    int CI = input_fp32.size(1);
-    int H  = input_fp32.size(2);
-    int W  = input_fp32.size(3);
-    int HW = H * W;
+    int batch = x_fp32.size(0);
+    int channel = x_fp32.size(1);
+    int height = x_fp32.size(2);
+    int width = x_fp32.size(3);
+    TORCH_CHECK(batch > 0 && channel > 0 && height > 0 && width > 0,
+                "BatchNorm dimensions must be non-empty");
 
-    auto output_fp32 = torch::empty_like(input_fp32);
+    torch::Tensor output_fp32 = torch::empty_like(x_fp32);
+    torch::Tensor partial_sum =
+        torch::empty({channel, BN_PARTS}, x_fp32.options());
+    torch::Tensor partial_sumsq =
+        torch::empty({channel, BN_PARTS}, x_fp32.options());
+    torch::Tensor mean = torch::empty({channel}, x_fp32.options());
+    torch::Tensor inv_std = torch::empty({channel}, x_fp32.options());
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t dim = {4, 1, 1};
+    cnrtDim3_t reduce_dim = {256, 1, 1};
+    cnrtDim3_t channel_dim = {64, 1, 1};
+    cnrtDim3_t apply_dim = {256, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
-    batchnorm_kernel<<<dim, ktype, queue>>>(
-        input_fp32.data_ptr<float>(),
+    batchnorm_reduce_kernel<<<reduce_dim, ktype, queue>>>(
+        x_fp32.data_ptr<float>(),
+        partial_sum.data_ptr<float>(),
+        partial_sumsq.data_ptr<float>(),
+        batch,
+        channel,
+        height,
+        width);
+
+    batchnorm_finalize_kernel<<<channel_dim, ktype, queue>>>(
+        partial_sum.data_ptr<float>(),
+        partial_sumsq.data_ptr<float>(),
+        mean.data_ptr<float>(),
+        inv_std.data_ptr<float>(),
+        batch,
+        channel,
+        height,
+        width);
+
+    int total = batch * channel * height * width;
+    batchnorm_apply_kernel<<<apply_dim, ktype, queue>>>(
+        x_fp32.data_ptr<float>(),
         output_fp32.data_ptr<float>(),
-        B, CI, HW
-    );
+        mean.data_ptr<float>(),
+        inv_std.data_ptr<float>(),
+        total,
+        channel,
+        height,
+        width);
 
     if (original_dtype != torch::kFloat) {
         return output_fp32.to(original_dtype);
     }
+
     return output_fp32;
 }
