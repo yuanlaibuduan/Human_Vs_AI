@@ -1,89 +1,82 @@
 #include <bang.h>
-#include <cnrt.h>
 #include <torch/extension.h>
+#include <cnrt.h>
+#include <stdint.h>
 
-__mlu_entry__ void zero_kernel(float* output, int total) {
-    int core_id = taskId;
-    int core_num = taskDim;
+#define MAX_D 256
+#define ALIGN_UP_64(x) (((x) + 63) & ~63)
 
-    for (int pos = core_id; pos < total; pos += core_num) {
-        output[pos] = 0.0f;
-    }
-}
+__mlu_entry__ void scatter_add_dim0_kernel(
+    float *src,
+    int64_t *index,
+    float *output,
+    int n_rows,
+    int d_cols,
+    int dim_size) {
 
-__mlu_entry__ void scatter_add_kernel(const float* src,
-                                      const int32_t* index,
-                                      float* output,
-                                      int N,
-                                      int D,
-                                      int dim_size) {
-    int core_id = taskId;
-    int core_num = taskDim;
+    __nram__ float acc[MAX_D + 64];
+    __nram__ float tmp[MAX_D + 64];
 
-    for (int row = 0; row < N; ++row) {
-        int out_row = index[row];
-        if (out_row < 0 || out_row >= dim_size) {
-            continue;
+    int aligned_d = ALIGN_UP_64(d_cols);
+
+    for (int dst = taskId; dst < dim_size; dst += taskDim) {
+        __bang_write_zero(acc, aligned_d);
+
+        for (int row = 0; row < n_rows; ++row) {
+            if ((int)index[row] == dst) {
+                __bang_write_zero(tmp, aligned_d);
+                __memcpy(
+                    tmp,
+                    src + row * d_cols,
+                    d_cols * sizeof(float),
+                    GDRAM2NRAM);
+                __bang_add(acc, acc, tmp, aligned_d);
+            }
         }
 
-        const float* src_row = src + row * D;
-        float* out_row_ptr = output + out_row * D;
-        for (int col = core_id; col < D; col += core_num) {
-            out_row_ptr[col] += src_row[col];
-        }
+        __memcpy(
+            output + dst * d_cols,
+            acc,
+            d_cols * sizeof(float),
+            NRAM2GDRAM);
     }
 }
 
 torch::Tensor bang_func(torch::Tensor src, torch::Tensor index, int dim_size) {
-    TORCH_CHECK(src.dim() == 2, "src must be 2D [N, D]");
-    TORCH_CHECK(index.dim() == 1, "index must be 1D [N]");
-    TORCH_CHECK(index.size(0) == src.size(0), "index length must match src.size(0)");
-    TORCH_CHECK(dim_size >= 0, "dim_size must be non-negative");
-    TORCH_CHECK(src.scalar_type() == torch::kFloat || src.scalar_type() == torch::kHalf,
-                "src must be float32 or float16");
-    TORCH_CHECK(index.scalar_type() == torch::kInt || index.scalar_type() == torch::kLong,
-                "index must be int32 or int64");
-
-    int64_t N64 = src.size(0);
-    int64_t D64 = src.size(1);
-    int64_t out_total64 = static_cast<int64_t>(dim_size) * D64;
-    TORCH_CHECK(N64 <= 2147483647LL && D64 <= 2147483647LL,
-                "src dimensions are too large for this implementation");
-    TORCH_CHECK(out_total64 <= 2147483647LL,
-                "output is too large for this implementation");
+    TORCH_CHECK(src.dim() == 2, "src must be a 2D tensor");
+    TORCH_CHECK(index.dim() == 1, "index must be a 1D tensor");
+    TORCH_CHECK(src.size(0) == index.size(0), "src and index row mismatch");
+    TORCH_CHECK(src.size(1) <= MAX_D, "src.shape[1] exceeds MAX_D");
+    TORCH_CHECK(dim_size > 0, "dim_size must be positive");
 
     auto original_dtype = src.scalar_type();
-    auto src_fp32 = src.contiguous().to(torch::kFloat);
-    auto index_i32 = index.contiguous();
-    if (index_i32.scalar_type() != torch::kInt) {
-        index_i32 = index_i32.to(torch::kInt);
-    }
+    torch::Tensor src_fp32 =
+        original_dtype == torch::kFloat ? src.contiguous()
+                                        : src.to(torch::kFloat).contiguous();
+    torch::Tensor index_i64 =
+        index.scalar_type() == torch::kLong ? index.contiguous()
+                                            : index.to(torch::kLong).contiguous();
 
-    auto output_fp32 = torch::empty({static_cast<int64_t>(dim_size), D64}, src_fp32.options());
-
-    int N = static_cast<int>(N64);
-    int D = static_cast<int>(D64);
-    int out_total = static_cast<int>(out_total64);
+    int n_rows = src_fp32.size(0);
+    int d_cols = src_fp32.size(1);
+    torch::Tensor output_fp32 =
+        torch::empty({dim_size, d_cols}, src_fp32.options());
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t dim = {4, 1, 1};
+    cnrtDim3_t kdim = {4, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
-    if (out_total > 0) {
-        zero_kernel<<<dim, ktype, queue>>>(output_fp32.data_ptr<float>(), out_total);
-    }
-    if (N > 0 && D > 0 && dim_size > 0) {
-        scatter_add_kernel<<<dim, ktype, queue>>>(
-            src_fp32.data_ptr<float>(),
-            index_i32.data_ptr<int32_t>(),
-            output_fp32.data_ptr<float>(),
-            N,
-            D,
-            dim_size);
+    scatter_add_dim0_kernel<<<kdim, ktype, queue>>>(
+        src_fp32.data_ptr<float>(),
+        index_i64.data_ptr<int64_t>(),
+        output_fp32.data_ptr<float>(),
+        n_rows,
+        d_cols,
+        dim_size);
+
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
     }
 
-    if (original_dtype == torch::kHalf) {
-        return output_fp32.to(torch::kHalf);
-    }
     return output_fp32;
 }
