@@ -1,84 +1,98 @@
 #include <bang.h>
-#include <cnrt.h>
 #include <torch/extension.h>
+#include <cnrt.h>
+#include <math.h>
 
-#define CHUNK_SIZE 4096
+#define KL_PARTS 4
 
-__mlu_entry__ void kl_div_kernel(
-    const float *target_prob,
-    const float *log_target,
-    const float *input_log_prob,
-    float *output,
+__mlu_entry__ void kl_div_reduce_kernel(
+    float *input_log_prob,
+    float *target_prob,
+    float *partial_sum,
     int total) {
 
-    uint32_t core_id = taskId;
-    uint32_t core_num = taskDim;
-    uint32_t per_core = total / core_num;
-    uint32_t remainder = total % core_num;
-    uint32_t start = core_id * per_core + (core_id < remainder ? core_id : remainder);
-    uint32_t count = per_core + (core_id < remainder ? 1 : 0);
+    for (int part = taskId; part < KL_PARTS; part += taskDim) {
+        int begin = part * total / KL_PARTS;
+        int end = (part + 1) * total / KL_PARTS;
+        float sum = 0.0f;
 
-    __nram__ float nram_target[CHUNK_SIZE];
-    __nram__ float nram_log_target[CHUNK_SIZE];
-    __nram__ float nram_input_log[CHUNK_SIZE];
+        for (int idx = begin; idx < end; ++idx) {
+            float target = target_prob[idx];
+            if (target > 0.0f) {
+                sum += target * (logf(target) - input_log_prob[idx]);
+            }
+        }
 
-    for (uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
-        uint32_t len = (offset + CHUNK_SIZE <= count) ? CHUNK_SIZE : (count - offset);
-        uint32_t aligned_len = (len + 63) & ~63;
-
-        __memcpy(nram_target,
-                 target_prob + start + offset,
-                 len * sizeof(float),
-                 GDRAM2NRAM);
-        __memcpy(nram_log_target,
-                 log_target + start + offset,
-                 len * sizeof(float),
-                 GDRAM2NRAM);
-        __memcpy(nram_input_log,
-                 input_log_prob + start + offset,
-                 len * sizeof(float),
-                 GDRAM2NRAM);
-
-        // log_target - input_log_prob → reuse nram_input_log buffer for diff
-        __bang_sub(nram_input_log, nram_log_target, nram_input_log, aligned_len);
-        // target * diff → reuse nram_target buffer for result
-        __bang_mul(nram_target, nram_target, nram_input_log, aligned_len);
-
-        __memcpy(output + start + offset,
-                 nram_target,
-                 len * sizeof(float),
-                 NRAM2GDRAM);
+        partial_sum[part] = sum;
     }
 }
 
-torch::Tensor bang_func(torch::Tensor input_log_prob, torch::Tensor target_prob) {
-    TORCH_CHECK(input_log_prob.is_contiguous(), "input_log_prob must be contiguous");
-    TORCH_CHECK(target_prob.is_contiguous(), "target_prob must be contiguous");
-    TORCH_CHECK(input_log_prob.dim() == 2, "input_log_prob must be 2D [batch, N]");
-    TORCH_CHECK(target_prob.sizes() == input_log_prob.sizes(),
-                "target_prob must have same shape as input_log_prob");
+__mlu_entry__ void kl_div_finalize_kernel(
+    float *partial_sum,
+    float *output,
+    int batch) {
 
-    auto log_prob_fp32 = input_log_prob.to(torch::kFloat);
-    auto target_fp32 = target_prob.to(torch::kFloat);
+    if (taskId != 0) {
+        return;
+    }
 
-    // Compute log(target + eps) on the host side for better numerical precision
-    auto log_target = torch::log(target_fp32 + 1e-8f);
+    float sum = 0.0f;
+    for (int i = 0; i < KL_PARTS; ++i) {
+        sum += partial_sum[i];
+    }
+    output[0] = sum / (float)batch;
+}
 
-    auto output = torch::empty_like(log_prob_fp32);
+torch::Tensor bang_func(
+    torch::Tensor input_log_prob,
+    torch::Tensor target_prob) {
 
-    int total = static_cast<int>(log_prob_fp32.numel());
+    TORCH_CHECK(input_log_prob.dim() == 2, "input_log_prob must be a 2D tensor");
+    TORCH_CHECK(target_prob.dim() == 2, "target_prob must be a 2D tensor");
+    TORCH_CHECK(input_log_prob.size(0) == target_prob.size(0),
+                "batch dimension mismatch");
+    TORCH_CHECK(input_log_prob.size(1) == target_prob.size(1),
+                "class dimension mismatch");
+
+    auto original_dtype = input_log_prob.scalar_type();
+    torch::Tensor input_fp32 =
+        original_dtype == torch::kFloat
+            ? input_log_prob.contiguous()
+            : input_log_prob.to(torch::kFloat).contiguous();
+    torch::Tensor target_fp32 =
+        target_prob.scalar_type() == torch::kFloat
+            ? target_prob.contiguous()
+            : target_prob.to(torch::kFloat).contiguous();
+
+    int batch = input_fp32.size(0);
+    int classes = input_fp32.size(1);
+    TORCH_CHECK(batch > 0 && classes > 0, "KL input dimensions must be non-empty");
+    int total = batch * classes;
+
+    torch::Tensor partial_sum =
+        torch::empty({KL_PARTS}, input_fp32.options());
+    torch::Tensor output_fp32 =
+        torch::empty({}, input_fp32.options());
+
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t reduce_dim = {4, 1, 1};
+    cnrtDim3_t finalize_dim = {4, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
-    cnrtDim3_t dim = {16, 1, 1};
-    kl_div_kernel<<<dim, ktype, queue>>>(
+    kl_div_reduce_kernel<<<reduce_dim, ktype, queue>>>(
+        input_fp32.data_ptr<float>(),
         target_fp32.data_ptr<float>(),
-        log_target.data_ptr<float>(),
-        log_prob_fp32.data_ptr<float>(),
-        output.data_ptr<float>(),
+        partial_sum.data_ptr<float>(),
         total);
 
-    // KL divergence with batchmean reduction:
-    // sum(target * (log(target) - input_log_prob)) / batch_size
-    return output.sum() / output.size(0);
+    kl_div_finalize_kernel<<<finalize_dim, ktype, queue>>>(
+        partial_sum.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
+        batch);
+
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
+    }
+
+    return output_fp32;
 }
