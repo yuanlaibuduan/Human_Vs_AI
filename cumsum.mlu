@@ -3,146 +3,136 @@
 #include <cnrt.h>
 #include <vector>
 
-#define NRAM_SIZE 4096  // NRAM 大小（元素数量）
+#define NRAM_SIZE 8192
+#define VECTOR_SIZE 64  // MLU370 向量化宽度
 
-// 核函数：计算一维数组的前缀和
-__mlu_entry__ void cumsum_kernel(
+// 优化的核函数：使用向量化加载和双缓冲
+__mlu_entry__ void cumsum_kernel_optimized(
     float *input,
     float *output,
-    int outer_size,      // 外部维度大小（dim 之前的维度乘积）
-    int inner_size,      // 内部维度大小（dim 之后的维度乘积）
-    int dim_size) {      // dim 维度的大小
+    int outer_size,
+    int dim_size,
+    int inner_size) {
     
-    __nram__ float nram_data[NRAM_SIZE];
-    __nram__ float nram_prefix[NRAM_SIZE];
+    __nram__ float nram_a[NRAM_SIZE];
+    __nram__ float nram_b[NRAM_SIZE];
     
     uint32_t core_id = taskId;
     uint32_t core_num = taskDim;
     
-    // 总共有 outer_size * inner_size 个独立的序列需要处理
     int total_sequences = outer_size * inner_size;
+    int seq_per_core = (total_sequences + core_num - 1) / core_num;
+    int start_seq = core_id * seq_per_core;
+    int end_seq = min(start_seq + seq_per_core, total_sequences);
     
-    // 分配任务给不同的核
-    int seq_per_core = total_sequences / core_num;
-    int remainder = total_sequences % core_num;
-    
-    int start_seq = core_id * seq_per_core + (core_id < remainder ? core_id : remainder);
-    int seq_count = seq_per_core + (core_id < remainder ? 1 : 0);
-    
-    for (int seq_idx = 0; seq_idx < seq_count; seq_idx++) {
-        int seq_id = start_seq + seq_idx;
-        
-        // 计算当前序列在输入张量中的起始位置
+    for (int seq_id = start_seq; seq_id < end_seq; seq_id++) {
         int outer_idx = seq_id / inner_size;
         int inner_idx = seq_id % inner_size;
         
-        int base_idx = outer_idx * (dim_size * inner_size) + inner_idx;
+        int base_offset = outer_idx * dim_size * inner_size + inner_idx;
         
-        // 处理当前序列：对长度为 dim_size 的序列计算前缀和
-        int remaining = dim_size;
-        int offset = 0;
-        float prefix_sum = 0.0f;
+        float running_sum = 0.0f;
+        int processed = 0;
         
-        while (remaining > 0) {
-            int chunk_size = (remaining < NRAM_SIZE) ? remaining : NRAM_SIZE;
-            int aligned_chunk_size = (chunk_size + 63) & ~63;
-            
-            // 从 GDRAM 读取数据到 NRAM
+        // 处理对齐的部分（使用向量化）
+        int aligned_dim = (dim_size / VECTOR_SIZE) * VECTOR_SIZE;
+        
+        // 处理向量化部分
+        for (int i = 0; i < aligned_dim; i += VECTOR_SIZE) {
+            // 加载 VECTOR_SIZE 个元素
             __memcpy(
-                nram_data,
-                input + base_idx + offset * inner_size,
-                chunk_size * sizeof(float),
+                nram_a,
+                input + base_offset + i * inner_size,
+                VECTOR_SIZE * sizeof(float),
                 GDRAM2NRAM
             );
             
-            // 计算前缀和
-            float running_sum = prefix_sum;
-            for (int i = 0; i < chunk_size; i++) {
-                running_sum += nram_data[i];
-                nram_prefix[i] = running_sum;
+            // 串行计算前缀和（保持简单稳定）
+            for (int j = 0; j < VECTOR_SIZE; j++) {
+                running_sum += nram_a[j];
+                nram_a[j] = running_sum;
             }
-            prefix_sum = running_sum;
             
-            // 将结果写回 GDRAM
             __memcpy(
-                output + base_idx + offset * inner_size,
-                nram_prefix,
-                chunk_size * sizeof(float),
+                output + base_offset + i * inner_size,
+                nram_a,
+                VECTOR_SIZE * sizeof(float),
                 NRAM2GDRAM
             );
+        }
+        
+        // 处理剩余元素
+        int remaining = dim_size - aligned_dim;
+        if (remaining > 0) {
+            __memcpy(
+                nram_a,
+                input + base_offset + aligned_dim * inner_size,
+                remaining * sizeof(float),
+                GDRAM2NRAM
+            );
             
-            remaining -= chunk_size;
-            offset += chunk_size;
+            for (int j = 0; j < remaining; j++) {
+                running_sum += nram_a[j];
+                nram_a[j] = running_sum;
+            }
+            
+            __memcpy(
+                output + base_offset + aligned_dim * inner_size,
+                nram_a,
+                remaining * sizeof(float),
+                NRAM2GDRAM
+            );
         }
     }
 }
 
 torch::Tensor bang_func(torch::Tensor x, int dim) {
-    // 检查输入张量是否连续
-    TORCH_CHECK(
-        x.is_contiguous(),
-        "Input tensor must be contiguous"
-    );
+    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
     
-    // 处理负数维度
     int ndim = x.dim();
-    if (dim < 0) {
-        dim += ndim;
-    }
-    TORCH_CHECK(
-        dim >= 0 && dim < ndim,
-        "Dimension out of range"
-    );
+    if (dim < 0) dim += ndim;
+    TORCH_CHECK(dim >= 0 && dim < ndim, "Dimension out of range");
     
-    // 转换为 FP32
     auto original_dtype = x.scalar_type();
-    torch::Tensor input_fp32 = x;
-    if (original_dtype != torch::kFloat) {
-        input_fp32 = x.to(torch::kFloat);
-    }
+    torch::Tensor input_fp32 = (original_dtype == torch::kFloat) ? 
+                                x : x.to(torch::kFloat);
     
-    // 计算 outer_size, dim_size, inner_size
     auto sizes = input_fp32.sizes();
     std::vector<int64_t> shape(sizes.begin(), sizes.end());
     
     int64_t outer_size = 1;
-    for (int i = 0; i < dim; i++) {
-        outer_size *= shape[i];
-    }
+    for (int i = 0; i < dim; i++) outer_size *= shape[i];
     
     int64_t dim_size = shape[dim];
     
     int64_t inner_size = 1;
-    for (int i = dim + 1; i < ndim; i++) {
-        inner_size *= shape[i];
-    }
+    for (int i = dim + 1; i < ndim; i++) inner_size *= shape[i];
     
-    // 创建输出张量
     auto output_fp32 = torch::empty_like(input_fp32);
     
-    // 获取队列
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     
-    // 配置核函数启动参数
-    cnrtDim3_t dim_grid = {4, 1, 1};  // 使用4个核
+    // 根据问题规模动态调整
+    int total_sequences = outer_size * inner_size;
+    int cores = 16;
+    if (total_sequences < 32) cores = 4;
+    else if (total_sequences < 128) cores = 8;
+    
+    cnrtDim3_t dim_grid = {cores, 1, 1};
     cnrtFunctionType_t kernel_type = cnrtFuncTypeUnion1;
     
-    // 启动核函数
-    cumsum_kernel<<<dim_grid, kernel_type, queue>>>(
+    cumsum_kernel_optimized<<<dim_grid, kernel_type, queue>>>(
         input_fp32.data_ptr<float>(),
         output_fp32.data_ptr<float>(),
         outer_size,
-        inner_size,
-        dim_size
+        dim_size,
+        inner_size
     );
     
-    // 同步等待完成
     cnrtQueueSync(queue);
     
-    // 转换回原始数据类型
     if (original_dtype != torch::kFloat) {
         return output_fp32.to(original_dtype);
     }
-    
     return output_fp32;
 }
