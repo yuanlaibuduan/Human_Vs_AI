@@ -63,21 +63,24 @@ __mlu_entry__ void batch_matmul_kernel(
                 for (int p = 0; p < k; p += TILE_SIZE) {
                     int tile_k = ((p + TILE_SIZE) <= k) ? TILE_SIZE : (k - p);
                     
-                    int a_size = tile_m * tile_k;
-                    int b_size = tile_k * tile_n;
-                    
-                    // 加载A的分块到NRAM - 需要处理非连续访问
+                    // 加载A的分块到NRAM
                     for (int r = 0; r < tile_m; r++) {
-                        for (int c = 0; c < tile_k; c++) {
-                            nram_A[r * tile_k + c] = batch_A[(i + r) * k + (p + c)];
-                        }
+                        __memcpy(
+                            nram_A + r * tile_k,
+                            batch_A + (i + r) * k + p,
+                            tile_k * sizeof(float),
+                            GDRAM2NRAM
+                        );
                     }
                     
                     // 加载B的分块到NRAM
                     for (int r = 0; r < tile_k; r++) {
-                        for (int c = 0; c < tile_n; c++) {
-                            nram_B[r * tile_n + c] = batch_B[(p + r) * n + (j + c)];
-                        }
+                        __memcpy(
+                            nram_B + r * tile_n,
+                            batch_B + (p + r) * n + j,
+                            tile_n * sizeof(float),
+                            GDRAM2NRAM
+                        );
                     }
                     
                     // 执行分块矩阵乘法
@@ -94,9 +97,12 @@ __mlu_entry__ void batch_matmul_kernel(
                 
                 // 写回结果到GDRAM
                 for (int r = 0; r < tile_m; r++) {
-                    for (int c = 0; c < tile_n; c++) {
-                        batch_C[(i + r) * n + (j + c)] = nram_C[r * tile_n + c];
-                    }
+                    __memcpy(
+                        batch_C + (i + r) * n + j,
+                        nram_C + r * tile_n,
+                        tile_n * sizeof(float),
+                        NRAM2GDRAM
+                    );
                 }
             }
         }
@@ -134,8 +140,8 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
         B_fp32 = B.to(torch::kFloat);
     }
     
-    // 创建输出张量
-    auto C_fp32 = torch::empty({batch_size, m, n}, torch::dtype(torch::kFloat));
+    // 创建输出张量 - 使用new_empty避免使用torch::empty
+    auto C_fp32 = A_fp32.new_empty({batch_size, m, n});
     
     // 获取MLU stream
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
