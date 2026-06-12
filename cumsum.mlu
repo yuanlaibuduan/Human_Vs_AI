@@ -49,6 +49,9 @@ torch::Tensor bang_func(torch::Tensor x, int dim) {
     int64_t ndim = x.dim();
     if (dim < 0) dim += ndim;
     TORCH_CHECK(dim >= 0 && dim < ndim, "Invalid dimension");
+    if (x.numel() == 0) {
+        return torch::empty_like(x);
+    }
 
     auto original_dtype = x.scalar_type();
 
@@ -64,9 +67,6 @@ torch::Tensor bang_func(torch::Tensor x, int dim) {
     }
 
     torch::Tensor x_fp32 = (original_dtype == torch::kFloat) ? x : x.to(torch::kFloat);
-    if (x_fp32.numel() == 0) {
-        return torch::empty_like(x);
-    }
 
     int64_t slice_len = x_fp32.size(-1);
     int64_t slice_count = x_fp32.numel() / slice_len;
