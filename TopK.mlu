@@ -1,0 +1,161 @@
+#include <bang.h>
+#include <cnrt.h>
+#include <torch/extension.h>
+
+#define TOPK_MAX_K 64
+
+__mlu_entry__ void topk_dim1_kernel(
+    const float *input,
+    float *values,
+    int64_t *indices,
+    int batch,
+    int width,
+    int k) {
+
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+
+    for (int row = core_id; row < batch; row += core_num) {
+        float top_values[TOPK_MAX_K];
+        int64_t top_indices[TOPK_MAX_K];
+
+        for (int i = 0; i < k; ++i) {
+            top_values[i] = -3.4028234663852886e38f;
+            top_indices[i] = 0;
+        }
+
+        const float *row_ptr = input + row * width;
+        for (int col = 0; col < width; ++col) {
+            float v = row_ptr[col];
+            int insert_pos = -1;
+
+            for (int t = 0; t < k; ++t) {
+                if (v > top_values[t] || (v == top_values[t] && col < top_indices[t])) {
+                    insert_pos = t;
+                    break;
+                }
+            }
+
+            if (insert_pos >= 0) {
+                for (int t = k - 1; t > insert_pos; --t) {
+                    top_values[t] = top_values[t - 1];
+                    top_indices[t] = top_indices[t - 1];
+                }
+                top_values[insert_pos] = v;
+                top_indices[insert_pos] = col;
+            }
+        }
+
+        float *out_values = values + row * k;
+        int64_t *out_indices = indices + row * k;
+        for (int t = 0; t < k; ++t) {
+            out_values[t] = top_values[t];
+            out_indices[t] = top_indices[t];
+        }
+    }
+}
+
+__mlu_entry__ void topk_dim0_kernel(
+    const float *input,
+    float *values,
+    int64_t *indices,
+    int batch,
+    int width,
+    int k) {
+
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+
+    for (int col = core_id; col < width; col += core_num) {
+        float top_values[TOPK_MAX_K];
+        int64_t top_indices[TOPK_MAX_K];
+
+        for (int i = 0; i < k; ++i) {
+            top_values[i] = -3.4028234663852886e38f;
+            top_indices[i] = 0;
+        }
+
+        for (int row = 0; row < batch; ++row) {
+            float v = input[row * width + col];
+            int insert_pos = -1;
+
+            for (int t = 0; t < k; ++t) {
+                if (v > top_values[t] || (v == top_values[t] && row < top_indices[t])) {
+                    insert_pos = t;
+                    break;
+                }
+            }
+
+            if (insert_pos >= 0) {
+                for (int t = k - 1; t > insert_pos; --t) {
+                    top_values[t] = top_values[t - 1];
+                    top_indices[t] = top_indices[t - 1];
+                }
+                top_values[insert_pos] = v;
+                top_indices[insert_pos] = row;
+            }
+        }
+
+        for (int t = 0; t < k; ++t) {
+            values[t * width + col] = top_values[t];
+            indices[t * width + col] = top_indices[t];
+        }
+    }
+}
+
+std::vector<torch::Tensor> bang_func(torch::Tensor x, int k, int dim) {
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(x.dim() == 2, "x must be 2D [batch, dim]");
+    TORCH_CHECK(dim == 0 || dim == 1, "TopK only supports dim 0 or 1");
+
+    int batch = static_cast<int>(x.size(0));
+    int width = static_cast<int>(x.size(1));
+    int reduce_size = (dim == 1) ? width : batch;
+    TORCH_CHECK(k > 0 && k <= reduce_size, "k must be in range (0, reduction size]");
+    TORCH_CHECK(k <= TOPK_MAX_K, "k exceeds TOPK_MAX_K");
+
+    auto original_dtype = x.scalar_type();
+    torch::Tensor x_fp32 = x;
+    if (original_dtype != torch::kFloat) {
+        x_fp32 = x.to(torch::kFloat);
+    }
+
+    std::vector<int64_t> out_shape;
+    if (dim == 1) {
+        out_shape = {x.size(0), k};
+    } else {
+        out_shape = {k, x.size(1)};
+    }
+
+    auto values_fp32 = torch::empty(out_shape, x_fp32.options());
+    auto indices = torch::empty(out_shape, x.options().dtype(torch::kLong));
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t cnrt_dim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    if (dim == 1) {
+        topk_dim1_kernel<<<cnrt_dim, ktype, queue>>>(
+            x_fp32.data_ptr<float>(),
+            values_fp32.data_ptr<float>(),
+            indices.data_ptr<int64_t>(),
+            batch,
+            width,
+            k);
+    } else {
+        topk_dim0_kernel<<<cnrt_dim, ktype, queue>>>(
+            x_fp32.data_ptr<float>(),
+            values_fp32.data_ptr<float>(),
+            indices.data_ptr<int64_t>(),
+            batch,
+            width,
+            k);
+    }
+
+    torch::Tensor values = values_fp32;
+    if (original_dtype != torch::kFloat) {
+        values = values_fp32.to(original_dtype);
+    }
+
+    return {values, indices};
+}
