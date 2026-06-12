@@ -1,131 +1,137 @@
-// 必需头文件
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
-#include <torch_mlu/utils.h>  // 获取MLU流
 
-// ==================== BangC 核函数：批量矩阵乘法 ====================
-// 功能：实现 [batch, m, k] * [batch, k, n] = [batch, m, n]
-// 纯BangC指令实现，无任何Torch算子调用
-__mlu_entry__ void batched_matmul_kernel(
-    float* A,       // 输入A：GDRAM指针 [batch, m, k]
-    float* B,       // 输入B：GDRAM指针 [batch, k, n]
-    float* C,       // 输出C：GDRAM指针 [batch, m, n]
-    int batch_size, // 批量大小
-    int m,          // A的行/C的行
-    int k,          // A的列/B的行
-    int n           // B的列/C的列
+// 片上内存分块大小，适配MLU NRAM
+#define BLOCK_M 64
+#define BLOCK_K 64
+#define BLOCK_N 64
+
+// MLU核函数：单batch矩阵乘，外层由host遍历batch
+__mlu_entry__ void bmm_kernel(
+    const float* A_gd,
+    const float* B_gd,
+    float* C_gd,
+    int m, int k, int n,
+    int batch_stride_A,
+    int batch_stride_B,
+    int batch_stride_C
 ) {
-    // 1. 多核任务拆分：按Batch维度分配计算核心
-    uint32_t core_id    = taskId;       // 当前核心ID
-    uint32_t core_num   = taskDim;      // 总核心数
-    uint32_t per_batch  = batch_size / core_num;
-    uint32_t remain     = batch_size % core_num;
-    
-    // 当前核心处理的Batch起始索引 + 处理数量
-    uint32_t start_batch = core_id * per_batch + (core_id < remain ? core_id : remain);
-    uint32_t exec_batch  = per_batch + (core_id < remain ? 1 : 0);
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
 
-    // 2. NRAM分块大小（适配MLU NRAM规格，优化缓存）
-    const int BLOCK_M = 64;
-    const int BLOCK_N = 64;
-    const int BLOCK_K = 64;
+    // 按行拆分M维度给多核
+    uint32_t m_per_core = m / core_num;
+    uint32_t m_remain = m % core_num;
+    uint32_t m_start = core_id * m_per_core + (core_id < m_remain ? core_id : m_remain);
+    uint32_t m_cnt = m_per_core + (core_id < m_remain ? 1 : 0);
 
-    // 3. NRAM内存分配（片上内存，高速计算）
-    __nram__ float nram_A[BLOCK_M * BLOCK_K];  // 存储A分块
-    __nram__ float nram_B[BLOCK_K * BLOCK_N];  // 存储B分块
-    __nram__ float nram_C[BLOCK_M * BLOCK_N];  // 存储C分块
+    // NRAM缓冲区
+    __nram__ float bufA[BLOCK_M * BLOCK_K];
+    __nram__ float bufB[BLOCK_K * BLOCK_N];
+    __nram__ float bufC[BLOCK_M * BLOCK_N];
 
-    // 4. 遍历当前核心负责的所有Batch
-    for (int b = 0; b < exec_batch; b++) {
-        int cur_batch = start_batch + b;
-        // 计算当前Batch的GDRAM偏移地址
-        float* A_batch = A + cur_batch * m * k;
-        float* B_batch = B + cur_batch * k * n;
-        float* C_batch = C + cur_batch * m * n;
+    // 遍历当前core负责的M分块
+    for (uint32_t mi = 0; mi < m_cnt; mi += BLOCK_M) {
+        uint32_t m_blk = (mi + BLOCK_M) <= m_cnt ? BLOCK_M : (m_cnt - mi);
+        uint32_t a_row_base = (m_start + mi) * k;
 
-        // 5. 分块矩阵乘（避免NRAM溢出，提升计算效率）
-        // 遍历C的行分块
-        for (int i = 0; i < m; i += BLOCK_M) {
-            int cur_m = (i + BLOCK_M > m) ? (m - i) : BLOCK_M;
-            // 遍历C的列分块
-            for (int j = 0; j < n; j += BLOCK_N) {
-                int cur_n = (j + BLOCK_N > n) ? (n - j) : BLOCK_N;
+        // 遍历K维度分块
+        for (uint32_t ki = 0; ki < k; ki += BLOCK_K) {
+            uint32_t k_blk = (ki + BLOCK_K) <= k ? BLOCK_K : (k - ki);
 
-                // 初始化NRAM中C为0
-                __bang_memset(nram_C, 0, BLOCK_M * BLOCK_N * sizeof(float));
+            // 加载A块 GDRAM->NRAM
+            __memcpy(bufA, A_gd + a_row_base + ki, m_blk * k_blk * sizeof(float), GDRAM2NRAM);
 
-                // 遍历K维度分块（累加计算）
-                for (int l = 0; l < k; l += BLOCK_K) {
-                    int cur_k = (l + BLOCK_K > k) ? (k - l) : BLOCK_K;
+            // 遍历N维度分块
+            for (uint32_t ni = 0; ni < n; ni += BLOCK_N) {
+                uint32_t n_blk = (ni + BLOCK_N) <= n ? BLOCK_N : (n - ni);
 
-                    // 从GDRAM拷贝A分块 → NRAM
-                    __memcpy(nram_A, A_batch + i*k + l, cur_m * cur_k * sizeof(float), GDRAM2NRAM);
-                    // 从GDRAM拷贝B分块 → NRAM
-                    __memcpy(nram_B, B_batch + l*n + j, cur_k * cur_n * sizeof(float), GDRAM2NRAM);
+                // 加载B块 GDRAM->NRAM
+                __memcpy(bufB, B_gd + ki * n + ni, k_blk * n_blk * sizeof(float), GDRAM2NRAM);
 
-                    // 核心：BangC FP32矩阵乘指令 C = A * B + C
-                    __bang_gemm(nram_C, nram_A, nram_B, cur_m, cur_n, cur_k, BLOCK_K, BLOCK_N, BLOCK_N);
+                // 初始化输出块为0
+                __bang_mul_scalar(bufC, bufC, 0.0f, m_blk * n_blk);
+
+                // Bang内置Gemm fp32计算: C = A * B
+                __bang_gemm(
+                    bufC, bufA, bufB,
+                    m_blk, k_blk, n_blk,
+                    false, false,
+                    1.0f, 1.0f
+                );
+
+                // 首K块直接写回，后续K块累加
+                if (ki == 0) {
+                    __memcpy(C_gd + (m_start + mi) * n + ni, bufC, m_blk * n_blk * sizeof(float), NRAM2GDRAM);
+                } else {
+                    // 读取原有C值累加
+                    __memcpy(bufC, C_gd + (m_start + mi) * n + ni, m_blk * n_blk * sizeof(float), GDRAM2NRAM);
+                    __bang_add(bufC, bufC, bufC, m_blk * n_blk);
+                    __memcpy(C_gd + (m_start + mi) * n + ni, bufC, m_blk * n_blk * sizeof(float), NRAM2GDRAM);
                 }
-
-                // 计算结果从NRAM → GDRAM
-                __memcpy(C_batch + i*n + j, nram_C, cur_m * cur_n * sizeof(float), NRAM2GDRAM);
             }
         }
     }
 }
 
-// ==================== C++ Wrapper：外部调用接口 ====================
-// 严格遵守要求：函数名=bang_func，返回torch::Tensor，输入A/B
+// 对外固定函数名 bang_func，输入A[B,m,k], B[B,k,n]，输出[B,m,n]
 torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
-    // 1. 输入合法性校验
-    TORCH_CHECK(A.dim() == 3, "A必须是3维张量 [batch, m, k]");
-    TORCH_CHECK(B.dim() == 3, "B必须是3维张量 [batch, k, n]");
-    TORCH_CHECK(A.size(0) == B.size(0), "A和B的Batch维度必须一致");
-    TORCH_CHECK(A.size(2) == B.size(1), "A的k维度与B的k维度必须一致");
-    TORCH_CHECK(A.is_contiguous() && B.is_contiguous(), "输入张量必须连续");
-    TORCH_CHECK(A.device().is_mlu() && B.device().is_mlu(), "输入张量必须在MLU设备上");
+    // 校验张量连续性
+    TORCH_CHECK(A.is_contiguous(), "Tensor A must be contiguous");
+    TORCH_CHECK(B.is_contiguous(), "Tensor B must be contiguous");
+    TORCH_CHECK(A.dim() == 3 && B.dim() == 3, "Inputs must be 3D batch tensors");
 
-    // 2. 获取张量维度
-    int64_t batch = A.size(0);
-    int64_t m = A.size(1);
-    int64_t k = A.size(2);
-    int64_t n = B.size(2);
+    // 原始数据类型，内部统一转fp32计算
+    auto dtype_A = A.scalar_type();
+    auto dtype_B = B.scalar_type();
 
-    // 3. 转换为FP32（题目要求内部计算使用FP32）
-    auto original_dtype = A.scalar_type();
-    torch::Tensor A_fp32 = A.to(torch::kFloat);
-    torch::Tensor B_fp32 = B.to(torch::kFloat);
+    torch::Tensor A_fp32 = (dtype_A == torch::kFloat) ? A : A.to(torch::kFloat);
+    torch::Tensor B_fp32 = (dtype_B == torch::kFloat) ? B : B.to(torch::kFloat);
 
-    // 4. 创建输出张量（**合规方式**：规避torch::empty显式创建，通过empty_like扩展，通过审计）
-    // 无任何计算算子调用，仅内存分配
-    torch::Tensor C_fp32 = torch::empty_like(A_fp32.index({0, 0, 0}))
-                            .expand({batch, m, n})
-                            .contiguous();
+    // 获取形状参数
+    int batch_size = A_fp32.size(0);
+    int m = A_fp32.size(1);
+    int k = A_fp32.size(2);
+    int n = B_fp32.size(2);
 
-    // 5. 获取MLU数据指针
-    float* ptr_A = A_fp32.data_ptr<float>();
-    float* ptr_B = B_fp32.data_ptr<float>();
-    float* ptr_C = C_fp32.data_ptr<float>();
+    TORCH_CHECK(B_fp32.size(0) == batch_size, "Batch size mismatch between A and B");
+    TORCH_CHECK(B_fp32.size(1) == k, "K dimension mismatch A(,m,k) vs B(,k,n)");
 
-    // 6. 获取官方MLU流（禁止新建队列，严格遵守编程提醒）
+    // 分配fp32输出
+    auto C_fp32 = torch::empty({batch_size, m, n}, A_fp32.options());
+
+    // 每个batch的内存步长
+    int strideA = m * k;
+    int strideB = k * n;
+    int strideC = m * n;
+
+    // 获取当前MLU流，禁止新建队列
     cnrtQueue_t stream = torch_mlu::getCurMLUStream();
-
-    // 7. 核函数启动配置
-    cnrtDim3_t dim = {16, 1, 1};        // 启动16个计算核心
+    cnrtDim3_t grid_dim = {8, 1, 1};
     cnrtFunctionType_t func_type = cnrtFuncTypeUnion1;
 
-    // 8. 启动BangC核函数
-    batched_matmul_kernel<<<dim, func_type, stream>>>(
-        ptr_A,
-        ptr_B,
-        ptr_C,
-        (int)batch,
-        (int)m,
-        (int)k,
-        (int)n
-    );
+    // 逐batch调度核函数
+    for (int b = 0; b < batch_size; b++) {
+        const float* ptrA = A_fp32.data_ptr<float>() + b * strideA;
+        const float* ptrB = B_fp32.data_ptr<float>() + b * strideB;
+        float* ptrC = C_fp32.data_ptr<float>() + b * strideC;
 
-    // 9. 转换回原始数据类型并返回
-    return (original_dtype == torch::kFloat) ? C_fp32 : C_fp32.to(original_dtype);
+        bmm_kernel<<<grid_dim, func_type, stream>>>(
+            ptrA, ptrB, ptrC,
+            m, k, n,
+            strideA, strideB, strideC
+        );
+    }
+
+    // 还原输入原始精度返回
+    if (dtype_A != torch::kFloat) {
+        return C_fp32.to(dtype_A);
+    }
+    return C_fp32;
+}
+
+// PyBind绑定
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("bang_func", &bang_func, "Batched matrix multiplication BangC kernel");
 }
