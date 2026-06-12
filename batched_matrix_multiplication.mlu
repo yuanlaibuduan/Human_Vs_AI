@@ -6,53 +6,75 @@
 #define N_BLOCK 64
 #define K_BLOCK 64
 
-__mlu_entry__ void bmm_kernel(float *A, float *B, float *C, int m, int k, int n) {
-    int batch = taskId;
-    float *A_batch = A + batch * m * k;
-    float *B_batch = B + batch * k * n;
-    float *C_batch = C + batch * m * n;
+__mlu_entry__ void bmm_kernel(float *A, float *B, float *C,
+                              int m, int k, int n, int batch_size) {
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
 
+    // 每个核处理的 batch 数量
+    int batches_per_core = (batch_size + core_num - 1) / core_num;
+    int start_batch = core_id * batches_per_core;
+    int end_batch = start_batch + batches_per_core;
+    if (end_batch > batch_size) end_batch = batch_size;
+
+    // NRAM 缓冲区
     __nram__ float nram_A[M_BLOCK * K_BLOCK];
     __nram__ float nram_B[K_BLOCK * N_BLOCK];
-    __nram__ float nram_tmp[M_BLOCK * N_BLOCK];
     __nram__ float nram_acc[M_BLOCK * N_BLOCK];
 
-    for (int i = 0; i < m; i += M_BLOCK) {
-        int M_cur = (i + M_BLOCK <= m) ? M_BLOCK : (m - i);
-        for (int j = 0; j < n; j += N_BLOCK) {
-            int N_cur = (j + N_BLOCK <= n) ? N_BLOCK : (n - j);
+    for (int batch = start_batch; batch < end_batch; ++batch) {
+        float *A_batch = A + batch * m * k;
+        float *B_batch = B + batch * k * n;
+        float *C_batch = C + batch * m * n;
 
-            __bang_write_zero(nram_acc, M_BLOCK * N_BLOCK);
+        for (int i = 0; i < m; i += M_BLOCK) {
+            int M_cur = (i + M_BLOCK <= m) ? M_BLOCK : (m - i);
+            for (int j = 0; j < n; j += N_BLOCK) {
+                int N_cur = (j + N_BLOCK <= n) ? N_BLOCK : (n - j);
 
-            for (int p = 0; p < k; p += K_BLOCK) {
-                int K_cur = (p + K_BLOCK <= k) ? K_BLOCK : (k - p);
+                // 清零累加器
+                __bang_write_zero(nram_acc, M_BLOCK * N_BLOCK);
 
-                // Load A block (M_cur x K_cur) into nram_A
-                __bang_write_zero(nram_A, M_BLOCK * K_BLOCK);
-                __memcpy_2d(nram_A, K_BLOCK * sizeof(float),
-                            A_batch + i * k + p, k * sizeof(float),
-                            K_cur * sizeof(float), M_cur, GDRAM2NRAM);
+                for (int p = 0; p < k; p += K_BLOCK) {
+                    int K_cur = (p + K_BLOCK <= k) ? K_BLOCK : (k - p);
 
-                // Load B block (K_cur x N_cur) into nram_B
-                __bang_write_zero(nram_B, K_BLOCK * N_BLOCK);
-                __memcpy_2d(nram_B, N_BLOCK * sizeof(float),
-                            B_batch + p * n + j, n * sizeof(float),
-                            N_cur * sizeof(float), K_cur, GDRAM2NRAM);
+                    // 拷贝 A 子块 (M_cur x K_cur) 到 nram_A
+                    for (int r = 0; r < M_cur; ++r) {
+                        __memcpy(nram_A + r * K_BLOCK,
+                                 A_batch + (i + r) * k + p,
+                                 K_cur * sizeof(float),
+                                 GDRAM2NRAM);
+                    }
 
-                // C_tmp = A_block * B_block
-                __bang_matmul(nram_tmp, nram_A, nram_B,
-                              M_BLOCK, K_BLOCK, N_BLOCK,
-                              0, 0, 0);
+                    // 拷贝 B 子块 (K_cur x N_cur) 到 nram_B
+                    for (int r = 0; r < K_cur; ++r) {
+                        __memcpy(nram_B + r * N_BLOCK,
+                                 B_batch + (p + r) * n + j,
+                                 N_cur * sizeof(float),
+                                 GDRAM2NRAM);
+                    }
 
-                // acc += tmp
-                __bang_add(nram_acc, nram_acc, nram_tmp,
-                           M_BLOCK * N_BLOCK);
+                    // 手动计算子矩阵乘法并累加
+                    for (int x = 0; x < M_cur; ++x) {
+                        for (int y = 0; y < N_cur; ++y) {
+                            float sum = 0.0f;
+                            for (int z = 0; z < K_cur; ++z) {
+                                sum += nram_A[x * K_BLOCK + z] *
+                                       nram_B[z * N_BLOCK + y];
+                            }
+                            nram_acc[x * N_BLOCK + y] += sum;
+                        }
+                    }
+                }
+
+                // 写回 C 子块 (M_cur x N_cur)
+                for (int r = 0; r < M_cur; ++r) {
+                    __memcpy(C_batch + (i + r) * n + j,
+                             nram_acc + r * N_BLOCK,
+                             N_cur * sizeof(float),
+                             NRAM2GDRAM);
+                }
             }
-
-            // Write back valid part of acc (M_cur x N_cur)
-            __memcpy_2d(C_batch + i * n + j, n * sizeof(float),
-                        nram_acc, N_BLOCK * sizeof(float),
-                        N_cur * sizeof(float), M_cur, NRAM2GDRAM);
         }
     }
 }
@@ -85,14 +107,16 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
     }
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t dim = {static_cast<uint32_t>(batch_size), 1, 1};
+    // 使用 16 个核心，每个核心处理多个 batch（可根据硬件调整）
+    int num_cores = 16;
+    cnrtDim3_t dim = {static_cast<uint32_t>(num_cores), 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
     bmm_kernel<<<dim, ktype, queue>>>(
         A_fp32.data_ptr<float>(),
         B_fp32.data_ptr<float>(),
         C_fp32.data_ptr<float>(),
-        m, k, n
+        m, k, n, batch_size
     );
 
     if (original_dtype != torch::kFloat) {
