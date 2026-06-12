@@ -53,8 +53,6 @@ torch::Tensor bang_func(torch::Tensor x, int dim) {
         return torch::empty_like(x);
     }
 
-    auto original_dtype = x.scalar_type();
-
     bool need_permute = (dim != ndim - 1);
     std::vector<int64_t> perm;
     if (need_permute) {
@@ -66,7 +64,7 @@ torch::Tensor bang_func(torch::Tensor x, int dim) {
         x = x.permute(perm).contiguous();
     }
 
-    torch::Tensor x_fp32 = (original_dtype == torch::kFloat) ? x : x.to(torch::kFloat);
+    torch::Tensor x_fp32 = x.to(torch::kFloat);
 
     int64_t slice_len = x_fp32.size(-1);
     int64_t slice_count = x_fp32.numel() / slice_len;
@@ -93,8 +91,5 @@ torch::Tensor bang_func(torch::Tensor x, int dim) {
         result = result.permute(inv_perm).contiguous();
     }
 
-    if (original_dtype != torch::kFloat) {
-        result = result.to(original_dtype);
-    }
     return result;
 }
