@@ -1,325 +1,228 @@
 #include <bang.h>
 #include <torch/extension.h>
-#include <torch_mlu/csrc/core/MLUStream.h>
 #include <cnrt.h>
-#include <stdint.h>
+#include <math.h>
 
-#define TASK_NUM 16
-#define CHUNK_SIZE 1024
+#define MAX_INPUT_SIZE 512
+#define MAX_HIDDEN_SIZE 512
 
-// gates 顺序按照 PyTorch GRU:
-// 0: reset gate r
-// 1: update gate z
-// 2: new gate n
-
-__mlu_entry__ void zero_kernel(float* ptr, int total) {
-    int tid = taskId;
-    int step = taskDim;
-
-    for (int i = tid; i < total; i += step) {
-        ptr[i] = 0.0f;
-    }
-}
-
-
-__mlu_entry__ void gru_linear_kernel(
-    const float* input_seq,
-    const float* h_state,
-    const float* weight_ih,
-    const float* weight_hh,
-    const float* bias_ih,
-    const float* bias_hh,
-    float* gates_x,
-    float* gates_h,
+__mlu_entry__ void gru_forward_kernel(
+    float *x,
+    float *weight_ih_l0,
+    float *weight_hh_l0,
+    float *bias_ih_l0,
+    float *bias_hh_l0,
+    float *weight_ih_l1,
+    float *weight_hh_l1,
+    float *bias_ih_l1,
+    float *bias_hh_l1,
+    float *output,
     int batch,
     int seq_len,
-    int cur_t,
     int input_size,
     int hidden_size) {
 
-    int total = batch * 3 * hidden_size;
-    int tid = taskId;
-    int step = taskDim;
+    __nram__ float input_buf[MAX_INPUT_SIZE];
+    __nram__ float h0_prev[MAX_HIDDEN_SIZE];
+    __nram__ float h0_new[MAX_HIDDEN_SIZE];
+    __nram__ float h1_prev[MAX_HIDDEN_SIZE];
+    __nram__ float h1_new[MAX_HIDDEN_SIZE];
 
-    for (int idx = tid; idx < total; idx += step) {
-        int b = idx / (3 * hidden_size);
-        int row = idx - b * 3 * hidden_size;
-
-        const float* x_ptr =
-            input_seq + (b * seq_len + cur_t) * input_size;
-
-        const float* h_ptr =
-            h_state + b * hidden_size;
-
-        const float* w_ih_row =
-            weight_ih + row * input_size;
-
-        const float* w_hh_row =
-            weight_hh + row * hidden_size;
-
-        float sx = bias_ih[row];
-        float sh = bias_hh[row];
-
-        for (int k = 0; k < input_size; ++k) {
-            sx += x_ptr[k] * w_ih_row[k];
+    for (int b = taskId; b < batch; b += taskDim) {
+        for (int h = 0; h < hidden_size; ++h) {
+            h0_prev[h] = 0.0f;
+            h1_prev[h] = 0.0f;
         }
 
-        for (int k = 0; k < hidden_size; ++k) {
-            sh += h_ptr[k] * w_hh_row[k];
-        }
+        for (int t = 0; t < seq_len; ++t) {
+            __memcpy(
+                input_buf,
+                x + (b * seq_len + t) * input_size,
+                input_size * sizeof(float),
+                GDRAM2NRAM);
 
-        gates_x[idx] = sx;
-        gates_h[idx] = sh;
+            for (int h = 0; h < hidden_size; ++h) {
+                int row_r = h;
+                int row_z = hidden_size + h;
+                int row_n = 2 * hidden_size + h;
+
+                float ir = bias_ih_l0[row_r];
+                float iz = bias_ih_l0[row_z];
+                float in_gate = bias_ih_l0[row_n];
+                float hr = bias_hh_l0[row_r];
+                float hz = bias_hh_l0[row_z];
+                float hn = bias_hh_l0[row_n];
+
+                for (int i = 0; i < input_size; ++i) {
+                    float v = input_buf[i];
+                    ir += weight_ih_l0[row_r * input_size + i] * v;
+                    iz += weight_ih_l0[row_z * input_size + i] * v;
+                    in_gate += weight_ih_l0[row_n * input_size + i] * v;
+                }
+
+                for (int i = 0; i < hidden_size; ++i) {
+                    float prev = h0_prev[i];
+                    hr += weight_hh_l0[row_r * hidden_size + i] * prev;
+                    hz += weight_hh_l0[row_z * hidden_size + i] * prev;
+                    hn += weight_hh_l0[row_n * hidden_size + i] * prev;
+                }
+
+                float r = 1.0f / (1.0f + expf(-(ir + hr)));
+                float z = 1.0f / (1.0f + expf(-(iz + hz)));
+                float n_val = tanhf(in_gate + r * hn);
+                h0_new[h] = n_val + z * (h0_prev[h] - n_val);
+            }
+
+            for (int h = 0; h < hidden_size; ++h) {
+                int row_r = h;
+                int row_z = hidden_size + h;
+                int row_n = 2 * hidden_size + h;
+
+                float ir = bias_ih_l1[row_r];
+                float iz = bias_ih_l1[row_z];
+                float in_gate = bias_ih_l1[row_n];
+                float hr = bias_hh_l1[row_r];
+                float hz = bias_hh_l1[row_z];
+                float hn = bias_hh_l1[row_n];
+
+                for (int i = 0; i < hidden_size; ++i) {
+                    float v = h0_new[i];
+                    ir += weight_ih_l1[row_r * hidden_size + i] * v;
+                    iz += weight_ih_l1[row_z * hidden_size + i] * v;
+                    in_gate += weight_ih_l1[row_n * hidden_size + i] * v;
+                }
+
+                for (int i = 0; i < hidden_size; ++i) {
+                    float prev = h1_prev[i];
+                    hr += weight_hh_l1[row_r * hidden_size + i] * prev;
+                    hz += weight_hh_l1[row_z * hidden_size + i] * prev;
+                    hn += weight_hh_l1[row_n * hidden_size + i] * prev;
+                }
+
+                float r = 1.0f / (1.0f + expf(-(ir + hr)));
+                float z = 1.0f / (1.0f + expf(-(iz + hz)));
+                float n_val = tanhf(in_gate + r * hn);
+                h1_new[h] = n_val + z * (h1_prev[h] - n_val);
+            }
+
+            __memcpy(
+                output + (b * seq_len + t) * hidden_size,
+                h1_new,
+                hidden_size * sizeof(float),
+                NRAM2GDRAM);
+
+            for (int h = 0; h < hidden_size; ++h) {
+                h0_prev[h] = h0_new[h];
+                h1_prev[h] = h1_new[h];
+            }
+        }
     }
 }
-
-
-__mlu_entry__ void gru_update_kernel(
-    const float* gates_x,
-    const float* gates_h,
-    float* h_state,
-    float* output_seq,
-    int batch,
-    int seq_len,
-    int cur_t,
-    int hidden_size) {
-
-    int chunks_per_batch =
-        (hidden_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
-
-    int total_chunks = batch * chunks_per_batch;
-
-    __nram__ float xr[CHUNK_SIZE];
-    __nram__ float xz[CHUNK_SIZE];
-    __nram__ float xn[CHUNK_SIZE];
-
-    __nram__ float hr[CHUNK_SIZE];
-    __nram__ float hz[CHUNK_SIZE];
-    __nram__ float hn[CHUNK_SIZE];
-
-    __nram__ float hprev[CHUNK_SIZE];
-    __nram__ float tmp[CHUNK_SIZE];
-
-    for (int cid = taskId; cid < total_chunks; cid += taskDim) {
-        int b = cid / chunks_per_batch;
-        int chunk_id = cid - b * chunks_per_batch;
-
-        int off = chunk_id * CHUNK_SIZE;
-        int len = hidden_size - off;
-        if (len > CHUNK_SIZE) {
-            len = CHUNK_SIZE;
-        }
-
-        int aligned_len = (len + 63) & ~63;
-
-        const float* gx_base = gates_x + b * 3 * hidden_size;
-        const float* gh_base = gates_h + b * 3 * hidden_size;
-
-        __memcpy(
-            xr,
-            gx_base + 0 * hidden_size + off,
-            len * sizeof(float),
-            GDRAM2NRAM);
-
-        __memcpy(
-            xz,
-            gx_base + 1 * hidden_size + off,
-            len * sizeof(float),
-            GDRAM2NRAM);
-
-        __memcpy(
-            xn,
-            gx_base + 2 * hidden_size + off,
-            len * sizeof(float),
-            GDRAM2NRAM);
-
-        __memcpy(
-            hr,
-            gh_base + 0 * hidden_size + off,
-            len * sizeof(float),
-            GDRAM2NRAM);
-
-        __memcpy(
-            hz,
-            gh_base + 1 * hidden_size + off,
-            len * sizeof(float),
-            GDRAM2NRAM);
-
-        __memcpy(
-            hn,
-            gh_base + 2 * hidden_size + off,
-            len * sizeof(float),
-            GDRAM2NRAM);
-
-        __memcpy(
-            hprev,
-            h_state + b * hidden_size + off,
-            len * sizeof(float),
-            GDRAM2NRAM);
-
-        // r = sigmoid(x_r + h_r)
-        __bang_add(xr, xr, hr, aligned_len);
-        __bang_active_sigmoid(xr, xr, aligned_len);
-
-        // z = sigmoid(x_z + h_z)
-        __bang_add(xz, xz, hz, aligned_len);
-        __bang_active_sigmoid(xz, xz, aligned_len);
-
-        // n = tanh(x_n + r * h_n)
-        __bang_mul(hn, hn, xr, aligned_len);
-        __bang_add(xn, xn, hn, aligned_len);
-        __bang_active_tanh(xn, xn, aligned_len);
-
-        // h = n + z * (h_prev - n)
-        __bang_sub(tmp, hprev, xn, aligned_len);
-        __bang_mul(tmp, tmp, xz, aligned_len);
-        __bang_add(xn, xn, tmp, aligned_len);
-
-        __memcpy(
-            h_state + b * hidden_size + off,
-            xn,
-            len * sizeof(float),
-            NRAM2GDRAM);
-
-        __memcpy(
-            output_seq + (b * seq_len + cur_t) * hidden_size + off,
-            xn,
-            len * sizeof(float),
-            NRAM2GDRAM);
-    }
-}
-
 
 torch::Tensor bang_func(
     torch::Tensor x,
-
     torch::Tensor weight_ih_l0,
     torch::Tensor weight_hh_l0,
     torch::Tensor bias_ih_l0,
     torch::Tensor bias_hh_l0,
-
     torch::Tensor weight_ih_l1,
     torch::Tensor weight_hh_l1,
     torch::Tensor bias_ih_l1,
     torch::Tensor bias_hh_l1,
-
     int input_size,
     int hidden_size,
     int num_layers) {
 
-    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
-    TORCH_CHECK(weight_ih_l0.is_contiguous(), "weight_ih_l0 must be contiguous");
-    TORCH_CHECK(weight_hh_l0.is_contiguous(), "weight_hh_l0 must be contiguous");
-    TORCH_CHECK(bias_ih_l0.is_contiguous(), "bias_ih_l0 must be contiguous");
-    TORCH_CHECK(bias_hh_l0.is_contiguous(), "bias_hh_l0 must be contiguous");
-    TORCH_CHECK(weight_ih_l1.is_contiguous(), "weight_ih_l1 must be contiguous");
-    TORCH_CHECK(weight_hh_l1.is_contiguous(), "weight_hh_l1 must be contiguous");
-    TORCH_CHECK(bias_ih_l1.is_contiguous(), "bias_ih_l1 must be contiguous");
-    TORCH_CHECK(bias_hh_l1.is_contiguous(), "bias_hh_l1 must be contiguous");
-
-    TORCH_CHECK(num_layers == 2, "this implementation supports num_layers = 2");
-    TORCH_CHECK(x.scalar_type() == torch::kFloat, "x must be float32");
-    TORCH_CHECK(weight_ih_l0.scalar_type() == torch::kFloat, "weight must be float32");
-
-    int batch = x.size(0);
-    int seq_len = x.size(1);
-
+    TORCH_CHECK(x.dim() == 3, "Input x must be [batch, seq_len, input_size]");
     TORCH_CHECK(x.size(2) == input_size, "input_size mismatch");
+    TORCH_CHECK(num_layers == 2, "This implementation expects num_layers == 2");
+    TORCH_CHECK(input_size <= MAX_INPUT_SIZE, "input_size exceeds local buffer");
+    TORCH_CHECK(hidden_size <= MAX_HIDDEN_SIZE, "hidden_size exceeds local buffer");
 
-    auto options = x.options();
+    TORCH_CHECK(weight_ih_l0.size(0) == 3 * hidden_size &&
+                    weight_ih_l0.size(1) == input_size,
+                "weight_ih_l0 shape mismatch");
+    TORCH_CHECK(weight_hh_l0.size(0) == 3 * hidden_size &&
+                    weight_hh_l0.size(1) == hidden_size,
+                "weight_hh_l0 shape mismatch");
+    TORCH_CHECK(weight_ih_l1.size(0) == 3 * hidden_size &&
+                    weight_ih_l1.size(1) == hidden_size,
+                "weight_ih_l1 shape mismatch");
+    TORCH_CHECK(weight_hh_l1.size(0) == 3 * hidden_size &&
+                    weight_hh_l1.size(1) == hidden_size,
+                "weight_hh_l1 shape mismatch");
+    TORCH_CHECK(bias_ih_l0.numel() == 3 * hidden_size, "bias_ih_l0 shape mismatch");
+    TORCH_CHECK(bias_hh_l0.numel() == 3 * hidden_size, "bias_hh_l0 shape mismatch");
+    TORCH_CHECK(bias_ih_l1.numel() == 3 * hidden_size, "bias_ih_l1 shape mismatch");
+    TORCH_CHECK(bias_hh_l1.numel() == 3 * hidden_size, "bias_hh_l1 shape mismatch");
 
-    auto layer0_out = torch::empty(
-        {batch, seq_len, hidden_size},
-        options);
+    auto original_dtype = x.scalar_type();
+    torch::Tensor x_fp32 =
+        original_dtype == torch::kFloat ? x.contiguous()
+                                        : x.to(torch::kFloat).contiguous();
+    torch::Tensor w_ih0 =
+        weight_ih_l0.scalar_type() == torch::kFloat
+            ? weight_ih_l0.contiguous()
+            : weight_ih_l0.to(torch::kFloat).contiguous();
+    torch::Tensor w_hh0 =
+        weight_hh_l0.scalar_type() == torch::kFloat
+            ? weight_hh_l0.contiguous()
+            : weight_hh_l0.to(torch::kFloat).contiguous();
+    torch::Tensor b_ih0 =
+        bias_ih_l0.scalar_type() == torch::kFloat
+            ? bias_ih_l0.contiguous()
+            : bias_ih_l0.to(torch::kFloat).contiguous();
+    torch::Tensor b_hh0 =
+        bias_hh_l0.scalar_type() == torch::kFloat
+            ? bias_hh_l0.contiguous()
+            : bias_hh_l0.to(torch::kFloat).contiguous();
+    torch::Tensor w_ih1 =
+        weight_ih_l1.scalar_type() == torch::kFloat
+            ? weight_ih_l1.contiguous()
+            : weight_ih_l1.to(torch::kFloat).contiguous();
+    torch::Tensor w_hh1 =
+        weight_hh_l1.scalar_type() == torch::kFloat
+            ? weight_hh_l1.contiguous()
+            : weight_hh_l1.to(torch::kFloat).contiguous();
+    torch::Tensor b_ih1 =
+        bias_ih_l1.scalar_type() == torch::kFloat
+            ? bias_ih_l1.contiguous()
+            : bias_ih_l1.to(torch::kFloat).contiguous();
+    torch::Tensor b_hh1 =
+        bias_hh_l1.scalar_type() == torch::kFloat
+            ? bias_hh_l1.contiguous()
+            : bias_hh_l1.to(torch::kFloat).contiguous();
 
-    auto output = torch::empty(
-        {batch, seq_len, hidden_size},
-        options);
+    int batch = x_fp32.size(0);
+    int seq_len = x_fp32.size(1);
+    TORCH_CHECK(batch > 0 && seq_len > 0, "GRU input dimensions must be non-empty");
 
-    auto h_state = torch::empty(
-        {batch, hidden_size},
-        options);
-
-    auto gates_x = torch::empty(
-        {batch, 3 * hidden_size},
-        options);
-
-    auto gates_h = torch::empty(
-        {batch, 3 * hidden_size},
-        options);
+    torch::Tensor output_fp32 =
+        torch::empty({batch, seq_len, hidden_size}, x_fp32.options());
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-
-    cnrtDim3_t dim;
-    dim.x = TASK_NUM;
-    dim.y = 1;
-    dim.z = 1;
-
+    cnrtDim3_t kdim = {32, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
-    // layer 0
-    zero_kernel<<<dim, ktype, queue>>>(
-        h_state.data_ptr<float>(),
-        batch * hidden_size);
+    gru_forward_kernel<<<kdim, ktype, queue>>>(
+        x_fp32.data_ptr<float>(),
+        w_ih0.data_ptr<float>(),
+        w_hh0.data_ptr<float>(),
+        b_ih0.data_ptr<float>(),
+        b_hh0.data_ptr<float>(),
+        w_ih1.data_ptr<float>(),
+        w_hh1.data_ptr<float>(),
+        b_ih1.data_ptr<float>(),
+        b_hh1.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
+        batch,
+        seq_len,
+        input_size,
+        hidden_size);
 
-    for (int t = 0; t < seq_len; ++t) {
-        gru_linear_kernel<<<dim, ktype, queue>>>(
-            x.data_ptr<float>(),
-            h_state.data_ptr<float>(),
-            weight_ih_l0.data_ptr<float>(),
-            weight_hh_l0.data_ptr<float>(),
-            bias_ih_l0.data_ptr<float>(),
-            bias_hh_l0.data_ptr<float>(),
-            gates_x.data_ptr<float>(),
-            gates_h.data_ptr<float>(),
-            batch,
-            seq_len,
-            t,
-            input_size,
-            hidden_size);
-
-        gru_update_kernel<<<dim, ktype, queue>>>(
-            gates_x.data_ptr<float>(),
-            gates_h.data_ptr<float>(),
-            h_state.data_ptr<float>(),
-            layer0_out.data_ptr<float>(),
-            batch,
-            seq_len,
-            t,
-            hidden_size);
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
     }
 
-    // layer 1
-    zero_kernel<<<dim, ktype, queue>>>(
-        h_state.data_ptr<float>(),
-        batch * hidden_size);
-
-    for (int t = 0; t < seq_len; ++t) {
-        gru_linear_kernel<<<dim, ktype, queue>>>(
-            layer0_out.data_ptr<float>(),
-            h_state.data_ptr<float>(),
-            weight_ih_l1.data_ptr<float>(),
-            weight_hh_l1.data_ptr<float>(),
-            bias_ih_l1.data_ptr<float>(),
-            bias_hh_l1.data_ptr<float>(),
-            gates_x.data_ptr<float>(),
-            gates_h.data_ptr<float>(),
-            batch,
-            seq_len,
-            t,
-            hidden_size,
-            hidden_size);
-
-        gru_update_kernel<<<dim, ktype, queue>>>(
-            gates_x.data_ptr<float>(),
-            gates_h.data_ptr<float>(),
-            h_state.data_ptr<float>(),
-            output.data_ptr<float>(),
-            batch,
-            seq_len,
-            t,
-            hidden_size);
-    }
-
-    return output;
+    return output_fp32;
 }
