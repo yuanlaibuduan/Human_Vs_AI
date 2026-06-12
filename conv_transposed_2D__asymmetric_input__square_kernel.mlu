@@ -1,144 +1,173 @@
+// conv_transposed_2D__asymmetric_input__square_kernel.cpp
 #include <bang.h>
-#include <cnrt.h>
 #include <torch/extension.h>
+#include <cnrt.h>
 
-__mlu_entry__ void conv_transpose2d_kernel(const float* input,
-                                           const float* weight,
-                                           float* output,
-                                           int batch,
-                                           int in_channels,
-                                           int h_in,
-                                           int w_in,
-                                           int out_channels,
-                                           int kernel_size,
-                                           int stride,
-                                           int padding,
-                                           int output_padding,
-                                           int groups,
-                                           int h_out,
-                                           int w_out) {
-    int total = batch * out_channels * h_out * w_out;
-    int core_id = taskId;
-    int core_num = taskDim;
+#define CIN_TILE 8
+#define COUT_TILE 8
+#define H_TILE 32
+#define W_TILE 32
+#define K 3
+#define H_EXT (H_TILE+K-1)
+#define W_EXT (W_TILE+K-1)
+#define ALIGNED_N 32
 
-    int out_channels_per_group = out_channels / groups;
-    int in_channels_per_group = in_channels / groups;
+__mlu_entry__ void convtransp2d_kernel(
+    float* input,
+    float* kernel_gdr,
+    float* output,
+    int B, int CI, int CO,
+    int HI, int WI,
+    int HO, int WO)
+{
+    uint32_t cid = taskId;
+    uint32_t cn = taskDim;
 
-    for (int idx = core_id; idx < total; idx += core_num) {
-        int tmp = idx;
-        int ow = tmp % w_out;
-        tmp /= w_out;
-        int oh = tmp % h_out;
-        tmp /= h_out;
-        int oc = tmp % out_channels;
-        int n = tmp / out_channels;
+    uint32_t co_tiles = (CO + COUT_TILE - 1) / COUT_TILE;
+    uint32_t h_tiles = (HO + H_TILE - 1) / H_TILE;
+    uint32_t w_tiles = (WO + W_TILE - 1) / W_TILE;
+    uint32_t total_tiles = B * co_tiles * h_tiles * w_tiles;
 
-        int group_id = oc / out_channels_per_group;
-        int oc_in_group = oc - group_id * out_channels_per_group;
-        int ic_begin = group_id * in_channels_per_group;
-        int ic_end = ic_begin + in_channels_per_group;
+    __nram__ float ni[CIN_TILE][H_EXT][W_EXT];
+    __nram__ float na[COUT_TILE][H_TILE][W_TILE];
+    __nram__ float nk[CIN_TILE][COUT_TILE][K][K];
+    __nram__ float nram_temp[ALIGNED_N];
 
-        float sum = 0.0f;
-        for (int ic = ic_begin; ic < ic_end; ++ic) {
-            for (int kh = 0; kh < kernel_size; ++kh) {
-                int ih_num = oh + padding - kh;
-                if (ih_num % stride != 0) {
-                    continue;
+    for (uint32_t tile = cid; tile < total_tiles; tile += cn) {
+        uint32_t t = tile;
+        uint32_t tw = t % w_tiles;
+        t /= w_tiles;
+        uint32_t th = t % h_tiles;
+        t /= h_tiles;
+        uint32_t tc = t % co_tiles;
+        uint32_t bi = t / co_tiles;
+
+        uint32_t co_g = tc * COUT_TILE;
+        uint32_t ho = th * H_TILE;
+        uint32_t wo = tw * W_TILE;
+        float* bin  = input  + bi * CI * HI * WI;
+        float* bout = output + bi * CO * HO * WO;
+
+        uint32_t cot = (co_g + COUT_TILE <= CO) ? COUT_TILE : (CO - co_g);
+        uint32_t ht = (ho + H_TILE <= HO) ? H_TILE : (HO - ho);
+        uint32_t wt = (wo + W_TILE <= WO) ? W_TILE : (WO - wo);
+        uint32_t he = ht + K - 1;
+        uint32_t we = wt + K - 1;
+
+        for (uint32_t co = 0; co < cot; co++)
+            for (uint32_t i = 0; i < ht; i++)
+                for (uint32_t j = 0; j < W_TILE; j++)
+                    na[co][i][j] = 0.0f;
+
+        for (uint32_t ci_g = 0; ci_g < CI; ci_g += CIN_TILE) {
+            uint32_t cit = (ci_g + CIN_TILE <= CI) ? CIN_TILE : (CI - ci_g);
+
+            for (uint32_t ci = 0; ci < cit; ci++) {
+                uint32_t gci = ci_g + ci;
+
+                for (uint32_t i = 0; i < he; i++)
+                    for (uint32_t j = 0; j < W_EXT; j++)
+                        ni[ci][i][j] = 0.0f;
+
+                int prs = (int)ho;
+                int pre = (int)(ho + he - 1);
+                int vs = K - 1;
+                int ve = K - 1 + HI - 1;
+                int cs = (prs > vs) ? prs : vs;
+                int ce = (pre < ve) ? pre : ve;
+
+                for (int r = cs; r <= ce; r++) {
+                    int ir = r - (K - 1);
+                    int pcs = (int)wo;
+                    int pce = (int)(wo + we - 1);
+                    int wvs = K - 1;
+                    int wve = K - 1 + WI - 1;
+                    int wcs = (pcs > wvs) ? pcs : wvs;
+                    int wce = (pce < wve) ? pce : wve;
+                    if (wcs <= wce)
+                        __memcpy(
+                            &ni[ci][r - (int)ho][wcs - (int)wo],
+                            bin + gci * HI * WI
+                                + ir * WI
+                                + (wcs - (K - 1)),
+                            (wce - wcs + 1) * sizeof(float),
+                            GDRAM2NRAM);
                 }
-                int ih = ih_num / stride;
-                if (ih < 0 || ih >= h_in) {
-                    continue;
-                }
 
-                for (int kw = 0; kw < kernel_size; ++kw) {
-                    int iw_num = ow + padding - kw;
-                    if (iw_num % stride != 0) {
-                        continue;
-                    }
-                    int iw = iw_num / stride;
-                    if (iw < 0 || iw >= w_in) {
-                        continue;
-                    }
-
-                    int input_idx = ((n * in_channels + ic) * h_in + ih) * w_in + iw;
-                    int weight_idx = ((ic * out_channels_per_group + oc_in_group) * kernel_size + kh) * kernel_size + kw;
-                    sum += input[input_idx] * weight[weight_idx];
+                for (uint32_t co = 0; co < cot; co++) {
+                    uint32_t gco = co_g + co;
+                    for (uint32_t kh = 0; kh < K; kh++)
+                        for (uint32_t kw = 0; kw < K; kw++)
+                            nk[ci][co][kh][kw] = kernel_gdr[
+                                (gci * CO + gco) * K * K
+                                + (K - 1 - kh) * K
+                                + (K - 1 - kw)];
                 }
             }
+
+            for (uint32_t co = 0; co < cot; co++)
+                for (uint32_t ci = 0; ci < cit; ci++)
+                    for (uint32_t kh = 0; kh < K; kh++)
+                        for (uint32_t hi = 0; hi < ht; hi++)
+                            for (uint32_t kw = 0; kw < K; kw++) {
+                                float wk = nk[ci][co][kh][kw];
+                                __bang_mul_scalar(nram_temp,
+                                                  &ni[ci][hi + kh][kw],
+                                                  wk,
+                                                  ALIGNED_N);
+                                __bang_add(na[co][hi], na[co][hi], nram_temp, ALIGNED_N);
+                            }
         }
 
-        output[idx] = sum;
+        for (uint32_t co = 0; co < cot; co++) {
+            uint32_t gco = co_g + co;
+            for (uint32_t hi = 0; hi < ht; hi++)
+                __memcpy(
+                    bout + gco * HO * WO + (ho + hi) * WO + wo,
+                    na[co][hi],
+                    wt * sizeof(float),
+                    NRAM2GDRAM);
+        }
     }
 }
 
-torch::Tensor bang_func(torch::Tensor x,
-                        torch::Tensor kernel,
-                        int in_channels,
-                        int out_channels,
-                        int kernel_size,
-                        int stride,
-                        int padding,
-                        int output_padding,
-                        int groups,
-                        bool bias) {
-    TORCH_CHECK(x.dim() == 4, "x must be 4D [batch, in_channels, h_in, w_in]");
-    TORCH_CHECK(kernel.dim() == 4, "kernel must be 4D [in_channels, out_channels // groups, k, k]");
-    TORCH_CHECK(stride > 0, "stride must be positive");
-    TORCH_CHECK(padding >= 0, "padding must be non-negative");
-    TORCH_CHECK(output_padding >= 0 && output_padding < stride,
-                "output_padding must satisfy 0 <= output_padding < stride");
-    TORCH_CHECK(groups > 0, "groups must be positive");
-    TORCH_CHECK(in_channels == x.size(1), "in_channels must match x.size(1)");
-    TORCH_CHECK(kernel.size(0) == in_channels, "kernel.size(0) must match in_channels");
-    TORCH_CHECK(kernel.size(2) == kernel_size && kernel.size(3) == kernel_size,
-                "kernel spatial size must match kernel_size");
-    TORCH_CHECK(in_channels % groups == 0, "in_channels must be divisible by groups");
-    TORCH_CHECK(out_channels % groups == 0, "out_channels must be divisible by groups");
-    TORCH_CHECK(kernel.size(1) == out_channels / groups,
-                "kernel.size(1) must equal out_channels // groups");
-    TORCH_CHECK(x.scalar_type() == torch::kFloat || x.scalar_type() == torch::kHalf,
-                "x must be float32 or float16");
+torch::Tensor bang_func(
+    torch::Tensor x,
+    torch::Tensor kernel,
+    int in_channels,
+    int out_channels,
+    int kernel_size,
+    int stride,
+    int padding,
+    int output_padding,
+    int groups,
+    bool bias)
+{
+    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
+    TORCH_CHECK(kernel.is_contiguous(), "Kernel must be contiguous");
 
-    (void)bias;
+    torch::Tensor ifp = (x.scalar_type() == torch::kFloat) ? x : x.to(torch::kFloat);
+    torch::Tensor kfp = (kernel.scalar_type() == torch::kFloat) ? kernel : kernel.to(torch::kFloat);
 
-    auto original_dtype = x.scalar_type();
-    auto x_fp32 = x.contiguous().to(torch::kFloat);
-    auto kernel_fp32 = kernel.contiguous().to(torch::kFloat);
+    int B  = ifp.size(0);
+    int CI = ifp.size(1);
+    int HI = ifp.size(2);
+    int WI = ifp.size(3);
+    int CO = out_channels;
+    int KS = kernel_size;
+    int HO = (HI - 1) * stride - 2 * padding + KS + output_padding;
+    int WO = (WI - 1) * stride - 2 * padding + KS + output_padding;
 
-    int batch = static_cast<int>(x_fp32.size(0));
-    int h_in = static_cast<int>(x_fp32.size(2));
-    int w_in = static_cast<int>(x_fp32.size(3));
-    int h_out = (h_in - 1) * stride - 2 * padding + kernel_size + output_padding;
-    int w_out = (w_in - 1) * stride - 2 * padding + kernel_size + output_padding;
-    TORCH_CHECK(h_out > 0 && w_out > 0, "calculated output size must be positive");
+    auto ofp = torch::empty({B, CO, HO, WO}, ifp.options());
 
-    auto output_fp32 = torch::empty({batch, out_channels, h_out, w_out}, x_fp32.options());
+    cnrtQueue_t q = torch_mlu::getCurMLUStream();
+    cnrtDim3_t d = {4, 1, 1};
 
-    int total = batch * out_channels * h_out * w_out;
-    uint32_t task_num = total < 1024 ? total : 1024;
-    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t dim = {task_num, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+    convtransp2d_kernel<<<d, cnrtFuncTypeUnion1, q>>>(
+        ifp.data_ptr<float>(),
+        kfp.data_ptr<float>(),
+        ofp.data_ptr<float>(),
+        B, CI, CO, HI, WI, HO, WO);
 
-    conv_transpose2d_kernel<<<dim, ktype, queue>>>(
-        x_fp32.data_ptr<float>(),
-        kernel_fp32.data_ptr<float>(),
-        output_fp32.data_ptr<float>(),
-        batch,
-        in_channels,
-        h_in,
-        w_in,
-        out_channels,
-        kernel_size,
-        stride,
-        padding,
-        output_padding,
-        groups,
-        h_out,
-        w_out);
-
-    if (original_dtype == torch::kHalf) {
-        return output_fp32.to(torch::kHalf);
-    }
-    return output_fp32;
+    return ofp;
 }
