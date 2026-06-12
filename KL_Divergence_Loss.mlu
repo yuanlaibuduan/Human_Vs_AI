@@ -21,8 +21,6 @@ __mlu_entry__ void kl_div_kernel(
     __nram__ float nram_target[CHUNK_SIZE];
     __nram__ float nram_log_target[CHUNK_SIZE];
     __nram__ float nram_input_log[CHUNK_SIZE];
-    __nram__ float nram_diff[CHUNK_SIZE];
-    __nram__ float nram_result[CHUNK_SIZE];
 
     for (uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
         uint32_t len = (offset + CHUNK_SIZE <= count) ? CHUNK_SIZE : (count - offset);
@@ -41,13 +39,13 @@ __mlu_entry__ void kl_div_kernel(
                  len * sizeof(float),
                  GDRAM2NRAM);
 
-        // log_target - input_log_prob
-        __bang_sub(nram_diff, nram_log_target, nram_input_log, aligned_len);
-        // target * (log_target - input_log_prob)
-        __bang_mul(nram_result, nram_target, nram_diff, aligned_len);
+        // log_target - input_log_prob → reuse nram_input_log buffer for diff
+        __bang_sub(nram_input_log, nram_log_target, nram_input_log, aligned_len);
+        // target * diff → reuse nram_target buffer for result
+        __bang_mul(nram_target, nram_target, nram_input_log, aligned_len);
 
         __memcpy(output + start + offset,
-                 nram_result,
+                 nram_target,
                  len * sizeof(float),
                  NRAM2GDRAM);
     }
@@ -72,7 +70,7 @@ torch::Tensor bang_func(torch::Tensor input_log_prob, torch::Tensor target_prob)
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
-    cnrtDim3_t dim = {4, 1, 1};
+    cnrtDim3_t dim = {16, 1, 1};
     kl_div_kernel<<<dim, ktype, queue>>>(
         target_fp32.data_ptr<float>(),
         log_target.data_ptr<float>(),
