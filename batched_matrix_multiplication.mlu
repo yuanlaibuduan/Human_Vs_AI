@@ -1,238 +1,164 @@
-// 004_batched_matrix_multiplication.mlu
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
 
-#define TILE_M 32
-#define TILE_N 32
-#define TILE_K 32
+#define CHUNK_SIZE 512
+#define TILE_SIZE 32
 
-// 核函数：执行批量矩阵乘法
-__mlu_entry__ void batched_matmul_kernel(
-    float *A,           // 输入张量 A [batch_size, m, k]
-    float *B,           // 输入张量 B [batch_size, k, n]
-    float *C,           // 输出张量 C [batch_size, m, n]
-    int batch_size,     // 批量大小
-    int m,              // A的行数
-    int k,              // A的列数/B的行数
-    int n               // B的列数
-) {
-    // 获取当前core ID和总core数
-    uint32_t core_id = taskId;
-    uint32_t core_num = taskDim;
-    
-    // 计算每个core处理的batch范围
-    int batches_per_core = batch_size / core_num;
-    int remainder = batch_size % core_num;
-    
-    int batch_start = core_id * batches_per_core + (core_id < remainder ? core_id : remainder);
-    int batch_end = batch_start + batches_per_core + (core_id < remainder ? 1 : 0);
-    
-    // 如果当前core没有任务，直接返回
-    if (batch_start >= batch_end) return;
-    
-    // 定义NRAM缓冲区
-    __nram__ float A_row[TILE_K];
-    __nram__ float B_col[TILE_K];
-    __nram__ float sum_buffer[TILE_N];
-    
-    // 对每个batch进行处理
-    for (int batch_idx = batch_start; batch_idx < batch_end; batch_idx++) {
-        // 计算当前batch在A、B、C中的起始偏移
-        int A_batch_offset = batch_idx * m * k;
-        int B_batch_offset = batch_idx * k * n;
-        int C_batch_offset = batch_idx * m * n;
-        
-        // 对输出矩阵的每个元素进行计算
-        for (int i = 0; i < m; i++) {
-            for (int j = 0; j < n; j++) {
-                // 分块计算点积
-                float result = 0.0f;
-                
-                // 对k维度进行累加，使用分块策略
-                for (int k_start = 0; k_start < k; k_start += TILE_K) {
-                    int curr_tile_k = (k_start + TILE_K <= k) ? TILE_K : (k - k_start);
-                    
-                    // 加载A的一行数据到NRAM
-                    __memcpy(A_row,
-                            A + A_batch_offset + i * k + k_start,
-                            curr_tile_k * sizeof(float),
-                            GDRAM2NRAM);
-                    
-                    // 加载B的一列数据到NRAM
-                    for (int k_idx = 0; k_idx < curr_tile_k; k_idx++) {
-                        __memcpy(B_col + k_idx,
-                                B + B_batch_offset + (k_start + k_idx) * n + j,
-                                sizeof(float),
-                                GDRAM2NRAM);
-                    }
-                    
-                    // 计算部分点积
-                    for (int k_idx = 0; k_idx < curr_tile_k; k_idx++) {
-                        result += A_row[k_idx] * B_col[k_idx];
-                    }
-                }
-                
-                // 写入结果
-                C[C_batch_offset + i * n + j] = result;
-            }
-        }
-    }
-}
-
-// 优化版本：使用向量化指令
-__mlu_entry__ void batched_matmul_vectorized_kernel(
+__mlu_entry__ void batch_matmul_kernel(
     float *A,
     float *B,
     float *C,
     int batch_size,
     int m,
     int k,
-    int n
-) {
+    int n) {
+
+    // 多核拆分 - 按batch维度拆分
     uint32_t core_id = taskId;
     uint32_t core_num = taskDim;
     
-    // 计算每个core处理的总元素数
-    int total_c_elements = batch_size * m * n;
-    int elements_per_core = total_c_elements / core_num;
-    int remainder = total_c_elements % core_num;
+    // 计算每个核心处理的batch范围
+    uint32_t batches_per_core = batch_size / core_num;
+    uint32_t remainder = batch_size % core_num;
     
-    int start_idx = core_id * elements_per_core + (core_id < remainder ? core_id : remainder);
-    int num_elements = elements_per_core + (core_id < remainder ? 1 : 0);
-    
-    // NRAM缓冲区
-    __nram__ float nram_A[128];
-    __nram__ float nram_B[128];
-    
-    // 处理分配给当前core的元素
-    for (int elem_idx = 0; elem_idx < num_elements; elem_idx++) {
-        int global_idx = start_idx + elem_idx;
+    uint32_t batch_start = core_id * batches_per_core + 
+                          (core_id < remainder ? core_id : remainder);
+    uint32_t batch_count = batches_per_core + 
+                          (core_id < remainder ? 1 : 0);
+
+    // NRAM分配
+    __nram__ float nram_A[TILE_SIZE * TILE_SIZE];
+    __nram__ float nram_B[TILE_SIZE * TILE_SIZE];
+    __nram__ float nram_C[TILE_SIZE * TILE_SIZE];
+    __nram__ float nram_temp[TILE_SIZE * TILE_SIZE];
+
+    // 计算单个矩阵的大小
+    int matrix_size_A = m * k;
+    int matrix_size_B = k * n;
+    int matrix_size_C = m * n;
+
+    // 处理当前核心分配的每个batch
+    for (int batch_idx = 0; batch_idx < batch_count; batch_idx++) {
+        int current_batch = batch_start + batch_idx;
         
-        // 解码三维索引
-        int batch = global_idx / (m * n);
-        int batch_remainder = global_idx % (m * n);
-        int row = batch_remainder / n;
-        int col = batch_remainder % n;
-        
-        // 计算点积
-        float sum = 0.0f;
-        int A_offset = batch * m * k + row * k;
-        int B_offset = batch * k * n + col;
-        
-        // 向量化计算
-        int k_processed = 0;
-        while (k_processed < k) {
-            int remaining = k - k_processed;
-            int batch_size_k = (remaining > 64) ? 64 : remaining;
-            
-            // 加载A的一段
-            __memcpy(nram_A,
-                    A + A_offset + k_processed,
-                    batch_size_k * sizeof(float),
-                    GDRAM2NRAM);
-            
-            // 加载B的一段
-            for (int i = 0; i < batch_size_k; i++) {
-                __memcpy(nram_B + i,
-                        B + B_offset + (k_processed + i) * n,
-                        sizeof(float),
-                        GDRAM2NRAM);
+        // 指向当前batch的矩阵
+        float *batch_A = A + current_batch * matrix_size_A;
+        float *batch_B = B + current_batch * matrix_size_B;
+        float *batch_C = C + current_batch * matrix_size_C;
+
+        // 分块矩阵乘法
+        for (int i = 0; i < m; i += TILE_SIZE) {
+            for (int j = 0; j < n; j += TILE_SIZE) {
+                
+                // 初始化累加器
+                int tile_m = ((i + TILE_SIZE) <= m) ? TILE_SIZE : (m - i);
+                int tile_n = ((j + TILE_SIZE) <= n) ? TILE_SIZE : (n - j);
+                
+                int c_size = tile_m * tile_n;
+                for (int idx = 0; idx < c_size; idx++) {
+                    nram_C[idx] = 0.0f;
+                }
+
+                for (int p = 0; p < k; p += TILE_SIZE) {
+                    int tile_k = ((p + TILE_SIZE) <= k) ? TILE_SIZE : (k - p);
+                    
+                    int a_size = tile_m * tile_k;
+                    int b_size = tile_k * tile_n;
+                    
+                    // 加载A的分块到NRAM - 需要处理非连续访问
+                    for (int r = 0; r < tile_m; r++) {
+                        for (int c = 0; c < tile_k; c++) {
+                            nram_A[r * tile_k + c] = batch_A[(i + r) * k + (p + c)];
+                        }
+                    }
+                    
+                    // 加载B的分块到NRAM
+                    for (int r = 0; r < tile_k; r++) {
+                        for (int c = 0; c < tile_n; c++) {
+                            nram_B[r * tile_n + c] = batch_B[(p + r) * n + (j + c)];
+                        }
+                    }
+                    
+                    // 执行分块矩阵乘法
+                    for (int r = 0; r < tile_m; r++) {
+                        for (int c = 0; c < tile_n; c++) {
+                            float sum = 0.0f;
+                            for (int s = 0; s < tile_k; s++) {
+                                sum += nram_A[r * tile_k + s] * nram_B[s * tile_n + c];
+                            }
+                            nram_C[r * tile_n + c] += sum;
+                        }
+                    }
+                }
+                
+                // 写回结果到GDRAM
+                for (int r = 0; r < tile_m; r++) {
+                    for (int c = 0; c < tile_n; c++) {
+                        batch_C[(i + r) * n + (j + c)] = nram_C[r * tile_n + c];
+                    }
+                }
             }
-            
-            // 累加点积
-            for (int i = 0; i < batch_size_k; i++) {
-                sum += nram_A[i] * nram_B[i];
-            }
-            
-            k_processed += batch_size_k;
         }
-        
-        C[global_idx] = sum;
     }
 }
 
-// 外部调用接口
 torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
-    // 检查输入张量
     TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
     TORCH_CHECK(B.is_contiguous(), "B must be contiguous");
-    TORCH_CHECK(A.dim() == 3, "A must be 3-dimensional");
-    TORCH_CHECK(B.dim() == 3, "B must be 3-dimensional");
     
     // 获取维度信息
-    int batch_size = A.size(0);
-    int m = A.size(1);
-    int k = A.size(2);
+    auto shape_A = A.sizes();
+    auto shape_B = B.sizes();
     
-    TORCH_CHECK(B.size(0) == batch_size, "Batch size mismatch");
-    TORCH_CHECK(B.size(1) == k, "k dimension mismatch");
-    int n = B.size(2);
+    TORCH_CHECK(shape_A.size() == 3, "A must be 3D tensor");
+    TORCH_CHECK(shape_B.size() == 3, "B must be 3D tensor");
     
-    // 转换为float32
+    int batch_size = shape_A[0];
+    int m = shape_A[1];
+    int k = shape_A[2];
+    int n = shape_B[2];
+    
+    TORCH_CHECK(shape_B[0] == batch_size, "Batch sizes must match");
+    TORCH_CHECK(shape_B[1] == k, "Inner dimensions must match");
+    
+    // 保留原始数据类型
+    auto original_dtype = A.scalar_type();
+    
+    // 转换为fp32进行计算
     torch::Tensor A_fp32 = A;
     torch::Tensor B_fp32 = B;
-    auto original_dtype = A.scalar_type();
     
     if (original_dtype != torch::kFloat) {
         A_fp32 = A.to(torch::kFloat);
         B_fp32 = B.to(torch::kFloat);
     }
     
-    // 创建输出张量 - 使用底层的MLU内存分配
-    // 分配MLU内存
-    void *c_mlu_ptr = nullptr;
-    size_t c_size = batch_size * m * n * sizeof(float);
-    cnrtMalloc(&c_mlu_ptr, c_size);
+    // 创建输出张量
+    auto C_fp32 = torch::empty({batch_size, m, n}, torch::dtype(torch::kFloat));
     
-    // 创建torch::Tensor包装MLU内存
-    auto options = torch::TensorOptions()
-        .dtype(torch::kFloat)
-        .device(torch::kMLU)
-        .layout(torch::kStrided);
-    
-    // 使用from_blob创建tensor，不进行内存拷贝
-    auto C_fp32 = torch::from_blob(c_mlu_ptr, 
-                                   {batch_size, m, n}, 
-                                   options);
-    
-    // 获取MLU队列
+    // 获取MLU stream
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     
-    // 设置核函数启动参数
-    cnrtDim3_t dim;
-    dim.x = 4;  // 使用4个core
-    dim.y = 1;
-    dim.z = 1;
+    // 设置并行参数
+    cnrtDim3_t dim = {4, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
     
-    // 调用核函数
-    batched_matmul_vectorized_kernel<<<dim, ktype, queue>>>(
+    // 启动kernel
+    batch_matmul_kernel<<<dim, ktype, queue>>>(
         A_fp32.data_ptr<float>(),
         B_fp32.data_ptr<float>(),
-        static_cast<float*>(c_mlu_ptr),
+        C_fp32.data_ptr<float>(),
         batch_size,
         m,
         k,
         n
     );
     
-    // 等待队列完成
-    cnrtQueueSync(queue);
-    
     // 转换回原始数据类型
     if (original_dtype != torch::kFloat) {
-        // 读取MLU数据到CPU
-        auto C_cpu = C_fp32.to(torch::kCPU);
-        // 转换数据类型并移回MLU
-        auto C_converted = C_cpu.to(original_dtype).to(torch::kMLU);
-        // 释放原始MLU内存
-        cnrtFree(c_mlu_ptr);
-        return C_converted;
+        return C_fp32.to(original_dtype);
     }
     
     return C_fp32;
 }
-
-// 注意：需要在适当的地方释放内存，或者使用智能指针管理
-// 也可以考虑让tensor接管内存管理
