@@ -1,118 +1,105 @@
-// 012_conv_transposed_2D__asymmetric_input__square_kernel.cpp
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
-#include <cstdint>
 
-// 核函数：执行转置卷积（FP32）
-// 布局：x [batch, in_c, h_in, w_in]
-//       w [in_c, out_c_per_group, k, k]  其中 out_c_per_group = out_channels / groups
-//       bias [out_channels] (可选)
-//       y [batch, out_c, h_out, w_out]
+#define CHUNK_SIZE 2048
+
+// 转置卷积输出尺寸计算公式
+static inline int calc_out_dim(int in_dim, int k, int s, int p, int op) {
+    return (in_dim - 1) * s - 2 * p + k + op;
+}
+
+// BangC MLU核函数：2D转置卷积，fp32计算
 __mlu_entry__ void conv_transpose2d_kernel(
-    const float* x,                     // 输入张量
-    const float* w,                     // 权重张量
-    const float* bias,                  // 偏置张量 (可为 nullptr)
-    float* y,                           // 输出张量
-    int batch, int in_c, int h_in, int w_in,               // 输入维度
-    int out_c, int h_out, int w_out,                       // 输出维度
-    int k, int stride, int padding, int output_padding,    // 卷积参数
-    int groups                                           // 分组数
+    float* g_in,               // input [B,IC,Hin,Win]
+    float* g_kernel,           // weight [IC, OC/groups, K, K]
+    float* g_bias,             // bias [OC], 空指针则无bias
+    float* g_out,              // output [B,OC,Hout,Wout]
+    int B, int IC, int OC, int Hin, int Win,
+    int K, int stride, int pad, int out_pad, int groups
 ) {
-    // 计算每个 group 对应的输入/输出通道数
-    int in_c_per_group = in_c / groups;
-    int out_c_per_group = out_c / groups;
-
-    // 获取当前 core 的 id 和总数
     uint32_t core_id = taskId;
-    uint32_t core_num = taskDim;
+    uint32_t core_num = taskDim.x;
 
-    // 总输出元素个数
-    int64_t total_elems = (int64_t)batch * out_c * h_out * w_out;
+    int OC_per_group = OC / groups;
+    int IC_per_group = IC / groups;
+    int Hout = calc_out_dim(Hin, K, stride, pad, out_pad);
+    int Wout = calc_out_dim(Win, K, stride, pad, out_pad);
+    int out_elem = B * OC * Hout * Wout;
 
-    // 每个 core 处理的元素数量（一维划分）
-    int64_t per_core = total_elems / core_num;
-    int64_t remainder = total_elems % core_num;
-    int64_t start = core_id * per_core + (core_id < remainder ? core_id : remainder);
-    int64_t count = per_core + (core_id < remainder ? 1 : 0);
+    // 多核均分输出元素
+    uint32_t per_core = out_elem / core_num;
+    uint32_t rem = out_elem % core_num;
+    uint32_t start = core_id * per_core + (core_id < rem ? core_id : rem);
+    uint32_t cnt = per_core + (core_id < rem ? 1 : 0);
 
-    // 寄存器变量，用于累加和循环
-    float sum;
-    int b, oc, oh, ow;          // 输出索引
-    int group_id, oc_in_group;  // 分组和组内输出通道
-    int ic_start, ic_end;       // 该输出通道对应的输入通道范围
-    int ih_base, iw_base;       // 输入位置基础
-    int kh, kw;                 // 卷积核索引
-    int ih, iw;                 // 实际输入位置
-    int64_t x_offset, w_offset, y_offset;
+    // NRAM缓冲区
+    __nram__ float n_in[CHUNK_SIZE];
+    __nram__ float n_ker[CHUNK_SIZE];
+    __nram__ float n_acc[CHUNK_SIZE];
+    __nram__ float n_bias_buf[CHUNK_SIZE];
 
-    // 临时存储输入和权重的值
-    float x_val, w_val;
+    // 遍历当前core负责的输出位置
+    for (uint32_t off = 0; off < cnt; off += CHUNK_SIZE) {
+        uint32_t chunk_len = ((off + CHUNK_SIZE) <= cnt) ? CHUNK_SIZE : (cnt - off);
+        uint32_t glob_out_idx = start + off;
 
-    for (int64_t idx = 0; idx < count; ++idx) {
-        int64_t linear_idx = start + idx;
-        // 解析输出位置: (b, oc, oh, ow)
-        int64_t tmp = linear_idx;
-        ow = tmp % w_out; tmp /= w_out;
-        oh = tmp % h_out; tmp /= h_out;
-        oc = tmp % out_c; tmp /= out_c;
-        b = tmp % batch;
+        // 清零累加缓冲区
+        __bang_memset(n_acc, 0, chunk_len * sizeof(float));
 
-        // 分组信息
-        group_id = oc / out_c_per_group;
-        oc_in_group = oc % out_c_per_group;
-        ic_start = group_id * in_c_per_group;
-        ic_end = ic_start + in_c_per_group;
+        // 拆解输出多维索引: out_idx = b*OC*Hout*Wout + oc*Hout*Wout + ho*Wout + wo
+        int b = glob_out_idx / (OC * Hout * Wout);
+        int rem1 = glob_out_idx % (OC * Hout * Wout);
+        int oc = rem1 / (Hout * Wout);
+        int ho = (rem1 % (Hout * Wout)) / Wout;
+        int wo = (rem1 % (Hout * Wout)) % Wout;
 
-        sum = 0.0f;
+        int g_idx = oc / OC_per_group; // 当前输出通道所属分组
+        int ocg = oc % OC_per_group;   // 组内输出通道id
 
-        // 遍历输入通道和卷积核
-        for (int ic = ic_start; ic < ic_end; ++ic) {
-            // 注意: 权重 shape 为 [in_c, out_c_per_group, k, k]
-            // 因此权重偏移: ic * out_c_per_group * k * k + oc_in_group * k * k
-            int64_t w_base = ((int64_t)ic * out_c_per_group + oc_in_group) * k * k;
+        // 遍历分组内所有输入通道
+        for (int icg = 0; icg < IC_per_group; icg++) {
+            int ic = g_idx * IC_per_group + icg; // 全局输入通道id
 
-            for (kh = 0; kh < k; ++kh) {
-                // 计算对应的输入高度: ih = (oh + padding - kh) / stride
-                // 需要满足整除条件且 ih 在有效范围内
-                int numerator_h = oh + padding - kh;
-                if (numerator_h < 0) continue;
-                if (numerator_h % stride != 0) continue;
-                ih = numerator_h / stride;
-                if (ih >= h_in) continue;
+            // 转置卷积逆推对应输入坐标与核坐标
+            int h_in_base = ho + pad;
+            int w_in_base = wo + pad;
 
-                for (kw = 0; kw < k; ++kw) {
-                    int numerator_w = ow + padding - kw;
-                    if (numerator_w < 0) continue;
-                    if (numerator_w % stride != 0) continue;
-                    iw = numerator_w / stride;
-                    if (iw >= w_in) continue;
+            // 遍历卷积核kh, kw
+            for (int kh = 0; kh < K; kh++) {
+                int h_in = h_in_base - kh * stride;
+                if (h_in < 0 || h_in >= Hin) continue;
+                for (int kw = 0; kw < K; kw++) {
+                    int w_in = w_in_base - kw * stride;
+                    if (w_in < 0 || w_in >= Win) continue;
 
-                    // 获取输入值: x[b, ic, ih, iw]
-                    x_offset = ((int64_t)b * in_c + ic) * h_in * w_in + (int64_t)ih * w_in + iw;
-                    x_val = x[x_offset];
+                    // 读取输入值 input[b, ic, h_in, w_in]
+                    size_t in_addr = b * IC * Hin * Win + ic * Hin * Win + h_in * Win + w_in;
+                    __memcpy(n_in, g_in + in_addr, sizeof(float), GDRAM2NRAM);
 
-                    // 获取权重值
-                    w_offset = w_base + (int64_t)kh * k + kw;
-                    w_val = w[w_offset];
+                    // 读取权重 weight[ic, ocg, kh, kw]
+                    size_t ker_addr = ic * OC_per_group * K * K + ocg * K * K + kh * K + kw;
+                    __memcpy(n_ker, g_kernel + ker_addr, sizeof(float), GDRAM2NRAM);
 
-                    sum += x_val * w_val;
+                    // 乘累加
+                    __bang_mul(n_in, n_in, n_ker, 1);
+                    __bang_add(n_acc, n_acc, n_in, chunk_len);
                 }
             }
         }
 
-        // 加偏置（如果提供）
-        if (bias != nullptr) {
-            sum += bias[oc];
+        // 加bias（如果开启bias）
+        if (g_bias != nullptr) {
+            __memcpy(n_bias_buf, g_bias + oc, sizeof(float), GDRAM2NRAM);
+            __bang_add_scalar(n_acc, n_acc, n_bias_buf[0], chunk_len);
         }
 
-        // 写回输出
-        y_offset = ((int64_t)b * out_c + oc) * h_out * w_out + (int64_t)oh * w_out + ow;
-        y[y_offset] = sum;
+        // 写回GDRAM输出
+        __memcpy(g_out + glob_out_idx, n_acc, chunk_len * sizeof(float), NRAM2GDRAM);
     }
 }
 
-// C++ wrapper 函数
+// 对外调用入口函数，固定名bang_func
 torch::Tensor bang_func(
     torch::Tensor x,
     torch::Tensor kernel,
@@ -123,98 +110,63 @@ torch::Tensor bang_func(
     int padding,
     int output_padding,
     int groups,
-    bool bias)
-{
-    // 输入检查
-    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
-    TORCH_CHECK(kernel.is_contiguous(), "kernel must be contiguous");
-    TORCH_CHECK(x.dim() == 4, "x must be 4D (batch, in_c, h, w)");
-    TORCH_CHECK(kernel.dim() == 4, "kernel must be 4D (in_c, out_c/group, k, k)");
+    bool bias
+) {
+    // 输入连续性校验
+    TORCH_CHECK(x.is_contiguous(), "input x must be contiguous");
+    TORCH_CHECK(kernel.is_contiguous(), "kernel weight must be contiguous");
+    TORCH_CHECK(x.dim() == 4, "input x shape must be [batch, in_c, hin, win]");
 
-    // 转为 FP32
-    auto original_dtype = x.scalar_type();
-    torch::Tensor x_fp32 = x;
-    torch::Tensor kernel_fp32 = kernel;
-    if (original_dtype != torch::kFloat) {
-        x_fp32 = x.to(torch::kFloat);
-    }
-    if (kernel.scalar_type() != torch::kFloat) {
-        kernel_fp32 = kernel.to(torch::kFloat);
-    }
+    auto orig_dtype = x.scalar_type();
+    // 统一转fp32计算
+    torch::Tensor x_fp32 = (orig_dtype == torch::kFloat) ? x : x.to(torch::kFloat);
+    torch::Tensor ker_fp32 = (kernel.scalar_type() == torch::kFloat) ? kernel : kernel.to(torch::kFloat);
 
-    // 提取输入维度
-    int batch = x_fp32.size(0);
-    int h_in = x_fp32.size(2);
-    int w_in = x_fp32.size(3);
-    // 验证 in_channels 匹配
-    TORCH_CHECK(in_channels == x_fp32.size(1), "in_channels mismatch");
+    int B = x_fp32.size(0);
+    int Hin = x_fp32.size(2);
+    int Win = x_fp32.size(3);
+    int K = kernel_size;
+    int OC = out_channels;
 
-    // 验证 kernel 形状
-    int64_t expected_kernel_shape0 = in_channels;
-    int64_t expected_kernel_shape1 = out_channels / groups;
-    TORCH_CHECK(kernel_fp32.size(0) == expected_kernel_shape0 &&
-                kernel_fp32.size(1) == expected_kernel_shape1 &&
-                kernel_fp32.size(2) == kernel_size &&
-                kernel_fp32.size(3) == kernel_size,
-                "kernel shape must be [in_channels, out_channels/groups, kernel_size, kernel_size]");
+    // 计算输出高宽
+    int Hout = calc_out_dim(Hin, K, stride, padding, output_padding);
+    int Wout = calc_out_dim(Win, K, stride, padding, output_padding);
 
-    // 计算输出空间尺寸
-    int h_out = (h_in - 1) * stride - 2 * padding + kernel_size + output_padding;
-    int w_out = (w_in - 1) * stride - 2 * padding + kernel_size + output_padding;
-    TORCH_CHECK(h_out > 0 && w_out > 0, "invalid output shape");
+    // 分配输出张量 [B, OC, Hout, Wout]
+    auto out_shape = torch::IntArrayRef({B, OC, Hout, Wout});
+    torch::Tensor out_fp32 = torch::empty(out_shape, x_fp32.options());
 
-    // 分配输出张量
-    auto options = torch::TensorOptions().dtype(torch::kFloat).device(x.device());
-    torch::Tensor y_fp32 = torch::empty({batch, out_channels, h_out, w_out}, options);
-
-    // 偏置张量（可选）
+    // bias处理
+    float* bias_ptr = nullptr;
     torch::Tensor bias_fp32;
-    const float* bias_ptr = nullptr;
     if (bias) {
-        TORCH_CHECK(kernel.device() == x.device(), "bias device mismatch");
-        // 偏置形状应为 [out_channels]，由外部传入？实际 bang_func 参数列表中没有 bias tensor，只有 bool bias。
-        // 题目描述中可选偏置张量，但 C++ wrapper 参数中没有 bias tensor，只有 bool bias。
-        // 参考实现中 bias 是 bool 控制是否添加可学习偏置，但偏置值需要从哪来？题目未提供 bias 张量输入。
-        // 根据常规，偏置应作为模型参数，但这里函数签名只有 bool bias，说明不需要外部传入偏置值，可能偏置为零或者忽略？
-        // 严格遵循题目：可选的偏置张量，但 wrapper 没有提供 bias tensor，说明我们只需处理 bias==true 时加一个可学习的偏置？
-        // 实际上在参考代码中，nn.ConvTranspose2d 的 bias 参数控制是否添加偏置，偏置参数是随机初始化的。
-        // 但这里我们无法获得偏置值，因此假定 bias 为 true 时偏置为零。或者为了正确性，我们忽略偏置，因为测试可能不涉及。
-        // 更合理的做法：要求调用者传入 bias tensor，但 wrapper 参数固定。考虑到题目要求 "参考实现内部计算改为fp32",
-        // 参考实现中 bias 是一个 bool，内部初始化时会创建 bias 参数。但调用 bang_func 时没有提供 bias tensor，
-        // 这意味着我们无法获得偏置值。为了避免错误，我们假设当 bias==true 时偏置为 0 向量（即不加偏置）。
-        // 或者修改 wrapper 接收 bias tensor? 但题目明确给出函数签名，不能更改。所以这里我们忽略偏置，不做加法。
-        // 由于输出对比时会与 torch 实现比较，torch 实现中有随机偏置，因此我们的结果会不同。这可能是题目疏忽。
-        // 根据经验，此类题目中 bias 为 true 时通常传入一个 bias tensor 作为单独参数，但此处没有，所以我们直接不加偏置。
-        // 为了安全，输出警告或简单忽略。
-        // 我们选择不使用偏置。
-        bias_ptr = nullptr;
+        bias_fp32 = torch::empty({OC}, x_fp32.options()).randn_like();
+        bias_ptr = bias_fp32.data_ptr<float>();
     }
 
-    // 获取 MLU 队列
+    // 获取MLU当前流
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t grid_dim = {8, 1, 1};
+    cnrtFunctionType_t func_type = cnrtFuncTypeUnion1;
 
-    // 设置核函数启动维度（一维 Union1 模式，使用 64 个核）
-    cnrtDim3_t dim = {64, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
-
-    // 启动核函数
-    conv_transpose2d_kernel<<<dim, ktype, queue>>>(
+    // 启动BangC核
+    conv_transpose2d_kernel<<<grid_dim, func_type, queue>>>(
         x_fp32.data_ptr<float>(),
-        kernel_fp32.data_ptr<float>(),
+        ker_fp32.data_ptr<float>(),
         bias_ptr,
-        y_fp32.data_ptr<float>(),
-        batch, in_channels, h_in, w_in,
-        out_channels, h_out, w_out,
-        kernel_size, stride, padding, output_padding,
-        groups
+        out_fp32.data_ptr<float>(),
+        B, in_channels, OC, Hin, Win,
+        K, stride, padding, output_padding, groups
     );
 
-    // 等待队列完成（可选，为了同步）
-    cnrtQueueSync(queue);
-
-    // 转回原始 dtype
-    if (original_dtype != torch::kFloat) {
-        return y_fp32.to(original_dtype);
+    // 还原原始数据类型
+    if (orig_dtype != torch::kFloat) {
+        return out_fp32.to(orig_dtype);
     }
-    return y_fp32;
+    return out_fp32;
+}
+
+// Pybind绑定
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("bang_func", &bang_func, "MLU BangC 2D Transposed Conv");
 }
