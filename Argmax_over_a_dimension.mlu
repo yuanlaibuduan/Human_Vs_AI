@@ -1,94 +1,221 @@
-// Argmax_over_a_dimension.cpp
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
+#include <stdint.h>
 
-#define CHUNK_SIZE 256
+#define TILE_COLS 256
+#define REDUCE_TILE 256
+#define DIM1_BLOCK_LIMIT 65536
 
-// MLU kernel: argmax along dim=1 for input [B, D1, D2]
-//   Input: [batch_size, dim1, dim2] = [16, 256, 256]
-//   Output: [batch_size, dim2] = [16, 256]
-//   Each output[b][j] = index of max in input[b][0:dim1][j]
-__mlu_entry__ void argmax_kernel(
-    float *input,
-    float *output,
-    int batch_size,
-    int dim1,
-    int dim2) {
+__mlu_entry__ void argmax_dim0_3d_kernel(
+    float *x,
+    int64_t *output,
+    int d0,
+    int d1,
+    int d2) {
 
-    uint32_t core_id = taskId;
-    uint32_t core_num = taskDim;
+    int total = d1 * d2;
+    for (int idx = taskId; idx < total; idx += taskDim) {
+        int j = idx / d2;
+        int k = idx - j * d2;
+        float max_val = x[j * d2 + k];
+        int64_t max_idx = 0;
 
-    // Distribute batches across cores
-    uint32_t batches_per_core = batch_size / core_num;
-    uint32_t batch_rem = batch_size % core_num;
-    uint32_t start_batch = core_id * batches_per_core +
-                           (core_id < batch_rem ? core_id : batch_rem);
-    uint32_t my_batches = batches_per_core +
-                          (core_id < batch_rem ? 1 : 0);
-
-    // NRAM buffer for one column along dim1
-    __nram__ float nram_col[CHUNK_SIZE];
-
-    for (uint32_t b = 0; b < my_batches; b++) {
-        uint32_t batch = start_batch + b;
-        float *batch_input = input + batch * dim1 * dim2;
-
-        for (uint32_t j = 0; j < dim2; j++) {
-            // Load column input[b][0:dim1][j] into NRAM
-            // Input is row-major: [dim1, dim2], so input[b][k][j] = input[k*dim2 + j]
-            for (uint32_t k = 0; k < dim1; k++) {
-                nram_col[k] = batch_input[k * dim2 + j];
+        for (int i = 1; i < d0; ++i) {
+            float v = x[(i * d1 + j) * d2 + k];
+            if (v > max_val) {
+                max_val = v;
+                max_idx = i;
             }
+        }
 
-            // Find argmax: index of maximum value in nram_col[0..dim1-1]
-            float max_val = nram_col[0];
-            uint32_t arg_idx = 0;
-            for (uint32_t k = 1; k < dim1; k++) {
-                if (nram_col[k] > max_val) {
-                    max_val = nram_col[k];
-                    arg_idx = k;
+        output[idx] = max_idx;
+    }
+}
+
+__mlu_entry__ void argmax_dim1_3d_kernel(
+    float *x,
+    int64_t *output,
+    int d0,
+    int d1,
+    int d2) {
+
+    int tile_count = (d2 + TILE_COLS - 1) / TILE_COLS;
+    int total_tiles = d0 * tile_count;
+
+    __nram__ float batch_vals[DIM1_BLOCK_LIMIT];
+    __nram__ float max_vals[TILE_COLS];
+    __nram__ float row_vals[TILE_COLS];
+    __nram__ int max_indices[TILE_COLS];
+
+    if (d1 * d2 <= DIM1_BLOCK_LIMIT) {
+        for (int n = taskId; n < d0; n += taskDim) {
+            __memcpy(
+                batch_vals,
+                x + n * d1 * d2,
+                d1 * d2 * sizeof(float),
+                GDRAM2NRAM);
+
+            int out_base = n * d2;
+            for (int k = 0; k < d2; ++k) {
+                float max_val = batch_vals[k];
+                int64_t max_idx = 0;
+
+                for (int j = 1; j < d1; ++j) {
+                    float v = batch_vals[j * d2 + k];
+                    if (v > max_val) {
+                        max_val = v;
+                        max_idx = j;
+                    }
+                }
+
+                output[out_base + k] = max_idx;
+            }
+        }
+        return;
+    }
+
+    for (int tile_task = taskId; tile_task < total_tiles; tile_task += taskDim) {
+        int n = tile_task / tile_count;
+        int tile = tile_task - n * tile_count;
+        int col_base = tile * TILE_COLS;
+        int tile_len = d2 - col_base;
+        if (tile_len > TILE_COLS) {
+            tile_len = TILE_COLS;
+        }
+
+        __memcpy(
+            max_vals,
+            x + n * d1 * d2 + col_base,
+            tile_len * sizeof(float),
+            GDRAM2NRAM);
+
+        for (int offset = 0; offset < tile_len; ++offset) {
+            max_indices[offset] = 0;
+        }
+
+        for (int j = 1; j < d1; ++j) {
+            __memcpy(
+                row_vals,
+                x + (n * d1 + j) * d2 + col_base,
+                tile_len * sizeof(float),
+                GDRAM2NRAM);
+
+            for (int offset = 0; offset < tile_len; ++offset) {
+                float v = row_vals[offset];
+                if (v > max_vals[offset]) {
+                    max_vals[offset] = v;
+                    max_indices[offset] = j;
                 }
             }
+        }
 
-            // Write result as float (integer index 0..255)
-            output[batch * dim2 + j] = (float)arg_idx;
+        int out_base = n * d2 + col_base;
+        for (int offset = 0; offset < tile_len; ++offset) {
+            output[out_base + offset] = (int64_t)max_indices[offset];
         }
     }
 }
 
-// C++ wrapper called by PyTorch
-torch::Tensor bang_func(torch::Tensor x, int dim) {
-    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
-    // argmax only implemented for dim=1
-    TORCH_CHECK(dim == 1, "Argmax: only dim=1 is supported, got dim=", dim);
+__mlu_entry__ void argmax_dim2_3d_kernel(
+    float *x,
+    int64_t *output,
+    int d0,
+    int d1,
+    int d2) {
 
-    // Preserve original data type
-    auto original_dtype = x.scalar_type();
-    torch::Tensor input_fp32 = x;
-    if (original_dtype != torch::kFloat) {
-        input_fp32 = x.to(torch::kFloat);
+    int total = d0 * d1;
+    __nram__ float vals[REDUCE_TILE];
+
+    for (int row = taskId; row < total; row += taskDim) {
+        int n = row / d1;
+        int j = row - n * d1;
+        int base = (n * d1 + j) * d2;
+
+        float max_val = x[base];
+        int64_t max_idx = 0;
+
+        for (int col_base = 0; col_base < d2; col_base += REDUCE_TILE) {
+            int tile_len = d2 - col_base;
+            if (tile_len > REDUCE_TILE) {
+                tile_len = REDUCE_TILE;
+            }
+
+            __memcpy(
+                vals,
+                x + base + col_base,
+                tile_len * sizeof(float),
+                GDRAM2NRAM);
+
+            int start = col_base == 0 ? 1 : 0;
+            for (int offset = start; offset < tile_len; ++offset) {
+                float v = vals[offset];
+                int64_t candidate_idx = col_base + offset;
+                if (v > max_val) {
+                    max_val = v;
+                    max_idx = candidate_idx;
+                }
+            }
+        }
+
+        output[row] = max_idx;
     }
+}
 
-    int batch_size = input_fp32.size(0);
-    int dim1 = input_fp32.size(1);
-    int dim2 = input_fp32.size(2);
+torch::Tensor bang_func(torch::Tensor x, int dim) {
+    TORCH_CHECK(x.dim() == 3, "Input x must be a 3D tensor");
 
-    auto output_fp32 = torch::empty({batch_size, dim2}, input_fp32.options());
+    int reduce_dim = dim;
+    if (reduce_dim < 0) {
+        reduce_dim += 3;
+    }
+    TORCH_CHECK(reduce_dim >= 0 && reduce_dim < 3, "dim must be in [-3, 2]");
+
+    torch::Tensor x_fp32 =
+        x.scalar_type() == torch::kFloat ? x.contiguous()
+                                         : x.to(torch::kFloat).contiguous();
+
+    int d0 = x_fp32.size(0);
+    int d1 = x_fp32.size(1);
+    int d2 = x_fp32.size(2);
+    TORCH_CHECK(d0 > 0 && d1 > 0 && d2 > 0, "Argmax dimensions must be non-empty");
+
+    auto out_options = x_fp32.options().dtype(torch::kLong);
+    torch::Tensor output;
+    if (reduce_dim == 0) {
+        output = torch::empty({d1, d2}, out_options);
+    } else if (reduce_dim == 1) {
+        output = torch::empty({d0, d2}, out_options);
+    } else {
+        output = torch::empty({d0, d1}, out_options);
+    }
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-
-    cnrtDim3_t cnrt_dim = {4, 1, 1};
+    cnrtDim3_t kdim = {16, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
-    argmax_kernel<<<cnrt_dim, ktype, queue>>>(
-        input_fp32.data_ptr<float>(),
-        output_fp32.data_ptr<float>(),
-        batch_size, dim1, dim2
-    );
-
-    if (original_dtype != torch::kFloat) {
-        return output_fp32.to(original_dtype);
+    if (reduce_dim == 0) {
+        argmax_dim0_3d_kernel<<<kdim, ktype, queue>>>(
+            x_fp32.data_ptr<float>(),
+            output.data_ptr<int64_t>(),
+            d0,
+            d1,
+            d2);
+    } else if (reduce_dim == 1) {
+        argmax_dim1_3d_kernel<<<kdim, ktype, queue>>>(
+            x_fp32.data_ptr<float>(),
+            output.data_ptr<int64_t>(),
+            d0,
+            d1,
+            d2);
+    } else {
+        argmax_dim2_3d_kernel<<<kdim, ktype, queue>>>(
+            x_fp32.data_ptr<float>(),
+            output.data_ptr<int64_t>(),
+            d0,
+            d1,
+            d2);
     }
-    return output_fp32;
+
+    return output;
 }
