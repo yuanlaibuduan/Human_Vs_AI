@@ -3,7 +3,7 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
-#define CHUNK_SIZE 4096   // 分块大小，必须是64的倍数以利用向量指令（这里主要用于NRAM缓存）
+#define CHUNK_SIZE 4096   // 分块大小，必须是64的倍数以利用向量指令
 
 // ------------------------------------------------------------
 // 核函数：矩阵向量乘法 C = A * B
@@ -24,9 +24,12 @@ __mlu_entry__ void gemv_kernel(float* A, float* B, float* C, int M, int K) {
 
     if (num_rows == 0) return;
 
-    // NRAM 缓冲区：B 的分块和 A 行中对应列的分块
+    // NRAM 缓冲区：
+    //   B_chunk  / A_chunk : 从全局内存加载的数据块
+    //   mul_temp          : 向量乘法的临时结果
     __nram__ float B_chunk[CHUNK_SIZE];
     __nram__ float A_chunk[CHUNK_SIZE];
+    __nram__ float mul_temp[CHUNK_SIZE];
 
     // 对当前 core 负责的每一行进行计算
     for (uint32_t i = 0; i < num_rows; ++i) {
@@ -36,15 +39,21 @@ __mlu_entry__ void gemv_kernel(float* A, float* B, float* C, int M, int K) {
         // 按块处理列维度
         for (uint32_t k_start = 0; k_start < K; k_start += CHUNK_SIZE) {
             uint32_t cur_len = (k_start + CHUNK_SIZE <= K) ? CHUNK_SIZE : (K - k_start);
+            // 对齐到 64 的倍数，以满足 __bang_mul 的向量化要求
+            uint32_t aligned_len = (cur_len + 63) & ~63;
 
-            // 从全局内存加载 B 的当前块
+            // 从全局内存加载 B 和 A 的当前块
             __memcpy(B_chunk, B + k_start, cur_len * sizeof(float), GDRAM2NRAM);
-            // 从全局内存加载 A 当前行的当前列块
             __memcpy(A_chunk, A + row * K + k_start, cur_len * sizeof(float), GDRAM2NRAM);
 
-            // 计算当前块的点积（标量循环，保证任意 cur_len 都能正确执行）
+            // 向量化乘法：一次完成 aligned_len 个元素的逐元素乘
+            // 注意：aligned_len 可能比 cur_len 大，多出的元素在 mul_temp 中为垃圾值，
+            //       但后续标量循环只累加前 cur_len 个元素，因此不影响正确性。
+            __bang_mul(mul_temp, A_chunk, B_chunk, aligned_len);
+
+            // 标量归约：累加当前块的所有有效元素
             for (uint32_t j = 0; j < cur_len; ++j) {
-                acc += A_chunk[j] * B_chunk[j];
+                acc += mul_temp[j];
             }
         }
 
@@ -63,7 +72,7 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
     TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
     TORCH_CHECK(B.is_contiguous(), "B must be contiguous");
 
-    // 转换为 float32 类型（参考实现内部使用 fp32）
+    // 转换为 float32 类型
     torch::Tensor A_fp32 = A;
     torch::Tensor B_fp32 = B;
     if (A.scalar_type() != torch::kFloat) {
@@ -85,8 +94,7 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
     // 获取当前 MLU 流（队列）
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
-    // 配置核函数启动参数
-    // 使用 16 个 core（可根据实际情况调整，不超过硬件限制）
+    // 配置核函数启动参数，使用 16 个 core
     cnrtDim3_t dim = {16, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
@@ -98,6 +106,6 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
         M, K
     );
 
-    // 返回结果（已经是 fp32，无需转换）
+    // 返回结果
     return C_fp32;
 }
