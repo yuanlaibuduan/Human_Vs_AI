@@ -3,12 +3,11 @@
 #include <torch/extension.h>
 
 #define CHUNK_SIZE 4096
-#define TASK_NUM 4
 
-__mlu_entry__ void mse_partial_sum_kernel(
+__mlu_entry__ void mse_square_kernel(
     const float *predictions,
     const float *targets,
-    float *partial_sums,
+    float *squared_errors,
     int total) {
 
     uint32_t core_id = taskId;
@@ -22,7 +21,6 @@ __mlu_entry__ void mse_partial_sum_kernel(
     __nram__ float nram_target[CHUNK_SIZE];
     __nram__ float nram_diff[CHUNK_SIZE];
 
-    float local_sum = 0.0f;
     for (uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
         uint32_t len = (offset + CHUNK_SIZE <= count) ? CHUNK_SIZE : (count - offset);
         uint32_t aligned_len = (len + 63) & ~63;
@@ -39,25 +37,11 @@ __mlu_entry__ void mse_partial_sum_kernel(
         __bang_sub(nram_diff, nram_pred, nram_target, aligned_len);
         __bang_mul(nram_diff, nram_diff, nram_diff, aligned_len);
 
-        for (uint32_t i = 0; i < len; ++i) {
-            local_sum += nram_diff[i];
-        }
+        __memcpy(squared_errors + start + offset,
+                 nram_diff,
+                 len * sizeof(float),
+                 NRAM2GDRAM);
     }
-
-    partial_sums[core_id] = local_sum;
-}
-
-__mlu_entry__ void mse_final_kernel(
-    const float *partial_sums,
-    float *loss,
-    int total,
-    int partial_count) {
-
-    float sum = 0.0f;
-    for (int i = 0; i < partial_count; ++i) {
-        sum += partial_sums[i];
-    }
-    loss[0] = sum / static_cast<float>(total);
 }
 
 torch::Tensor bang_func(torch::Tensor predictions, torch::Tensor targets) {
@@ -68,26 +52,18 @@ torch::Tensor bang_func(torch::Tensor predictions, torch::Tensor targets) {
 
     auto pred_fp32 = predictions.to(torch::kFloat);
     auto target_fp32 = targets.to(torch::kFloat);
-    auto partial_sums = torch::empty({TASK_NUM}, pred_fp32.options());
-    auto loss = torch::empty({}, pred_fp32.options());
+    auto squared_errors = torch::empty_like(pred_fp32);
 
     int total = static_cast<int>(pred_fp32.numel());
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
-    cnrtDim3_t partial_dim = {TASK_NUM, 1, 1};
-    mse_partial_sum_kernel<<<partial_dim, ktype, queue>>>(
+    cnrtDim3_t dim = {4, 1, 1};
+    mse_square_kernel<<<dim, ktype, queue>>>(
         pred_fp32.data_ptr<float>(),
         target_fp32.data_ptr<float>(),
-        partial_sums.data_ptr<float>(),
+        squared_errors.data_ptr<float>(),
         total);
 
-    cnrtDim3_t final_dim = {1, 1, 1};
-    mse_final_kernel<<<final_dim, ktype, queue>>>(
-        partial_sums.data_ptr<float>(),
-        loss.data_ptr<float>(),
-        total,
-        TASK_NUM);
-
-    return loss;
+    return squared_errors.mean();
 }
