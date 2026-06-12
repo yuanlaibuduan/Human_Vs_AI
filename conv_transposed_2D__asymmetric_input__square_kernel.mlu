@@ -1,6 +1,5 @@
 #include <bang.h>
 #include <cnrt.h>
-#include <ATen/ops/conv_transpose2d.h>
 #include <torch/extension.h>
 
 __mlu_entry__ void conv_transpose2d_kernel(const float* input,
@@ -102,22 +101,44 @@ torch::Tensor bang_func(torch::Tensor x,
 
     (void)bias;
 
-    auto x_contig = x.contiguous();
-    auto kernel_contig = kernel.contiguous();
+    auto original_dtype = x.scalar_type();
+    auto x_fp32 = x.contiguous().to(torch::kFloat);
+    auto kernel_fp32 = kernel.contiguous().to(torch::kFloat);
 
-    int h_in = static_cast<int>(x_contig.size(2));
-    int w_in = static_cast<int>(x_contig.size(3));
+    int batch = static_cast<int>(x_fp32.size(0));
+    int h_in = static_cast<int>(x_fp32.size(2));
+    int w_in = static_cast<int>(x_fp32.size(3));
     int h_out = (h_in - 1) * stride - 2 * padding + kernel_size + output_padding;
     int w_out = (w_in - 1) * stride - 2 * padding + kernel_size + output_padding;
     TORCH_CHECK(h_out > 0 && w_out > 0, "calculated output size must be positive");
 
-    return at::conv_transpose2d(
-        x_contig,
-        kernel_contig,
-        c10::nullopt,
-        {stride, stride},
-        {padding, padding},
-        {output_padding, output_padding},
+    auto output_fp32 = torch::empty({batch, out_channels, h_out, w_out}, x_fp32.options());
+
+    int total = batch * out_channels * h_out * w_out;
+    uint32_t task_num = total < 1024 ? total : 1024;
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {task_num, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    conv_transpose2d_kernel<<<dim, ktype, queue>>>(
+        x_fp32.data_ptr<float>(),
+        kernel_fp32.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
+        batch,
+        in_channels,
+        h_in,
+        w_in,
+        out_channels,
+        kernel_size,
+        stride,
+        padding,
+        output_padding,
         groups,
-        {1, 1});
+        h_out,
+        w_out);
+
+    if (original_dtype == torch::kHalf) {
+        return output_fp32.to(torch::kHalf);
+    }
+    return output_fp32;
 }
